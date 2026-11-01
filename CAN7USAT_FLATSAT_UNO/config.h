@@ -137,8 +137,11 @@
 #define LAUNCH_DETECT_ALT         15.0f
 #define MIN_APOGEE_ALT            750.0f
 #define APOGEE_DROP_THRESH        20.0f
-#define PARAFOIL_DEPLOY_ALT       700.0f
-#define DEPLOYMENT_DURATION_SEC   30.0f     // 30.0s deployment pulse duration
+#define PARAFOIL_DEPLOY_ALT       750.0f    // Burnwire deployment trigger altitude (750m AGL)
+#define SERVO_START_ALT           500.0f    // Servos start up & precision guidance begins (500m AGL)
+#define BURNWIRE_VEL_DROP_THRESH  3.0f      // Burnwire pulses until descent velocity decreases by 3.0 m/s
+#define BURNWIRE_MAX_DURATION_MS  30000UL   // 30.0s max thermal safety pulse cutoff
+#define BURNWIRE_DURATION_MS      BURNWIRE_MAX_DURATION_MS
 #define FINAL_APPROACH_ALT        120.0f
 #define FINAL_APPROACH_RADIUS     100.0f
 #define TERMINAL_MARGIN           100.0f

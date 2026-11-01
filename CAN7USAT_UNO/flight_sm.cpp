@@ -10,6 +10,8 @@ void FlightStateMachine::reset() {
     current_state = FlightState::BOOT;
     max_altitude = 0.0f;
     last_altitude = 0.0f;
+    filtered_descent_rate = 0.0f;
+    deploy_trigger_vz = 0.0f;
     state_entry_time_ms = 0;
     still_start_time_ms = 0;
     burnwire_start_ms = 0;
@@ -27,6 +29,7 @@ void FlightStateMachine::transitionTo(FlightState next_state, uint32_t now_ms) {
     if (next_state == FlightState::PARAFOIL_DEPLOYMENT) {
         burnwire_active = true;
         burnwire_start_ms = now_ms;
+        deploy_trigger_vz = (filtered_descent_rate > 5.0f) ? filtered_descent_rate : DROGUE_DESCENT_RATE;
         buzzer_active = false;
     } else {
         burnwire_active = false;
@@ -40,14 +43,8 @@ void FlightStateMachine::forceState(FlightState next_state, uint32_t now_ms) {
 }
 
 void FlightStateMachine::tickTimers(uint32_t now_ms) {
-    if (burnwire_active && (now_ms - burnwire_start_ms >= BURNWIRE_DURATION_MS)) {
+    if (burnwire_active && (now_ms - burnwire_start_ms >= BURNWIRE_MAX_DURATION_MS)) {
         burnwire_active = false;
-    }
-    // Auto-advance out of deployment into guidance once 30s pulse has elapsed
-    if (current_state == FlightState::PARAFOIL_DEPLOYMENT) {
-        if (now_ms - state_entry_time_ms >= BURNWIRE_DURATION_MS) {
-            transitionTo(FlightState::PRECISION_GUIDANCE, now_ms);
-        }
     }
 }
 
@@ -72,7 +69,7 @@ void FlightStateMachine::update(
     float heading,
     const LocalPoint& pos,
     const LocalPoint& target,
-    float /*dt*/,
+    float dt,
     uint32_t now_ms
 ) {
     if (state_entry_time_ms == 0) state_entry_time_ms = now_ms;
@@ -82,8 +79,16 @@ void FlightStateMachine::update(
         max_altitude = alt_agl;
     }
 
-    // Burnwire 30s pulse cutoff
-    if (burnwire_active && (now_ms - burnwire_start_ms >= BURNWIRE_DURATION_MS)) {
+    // Update estimated descent rate (m/s)
+    if (last_altitude > 0.0f && dt > 0.001f) {
+        float raw_vz = (last_altitude - alt_agl) / dt;
+        if (raw_vz < -20.0f) raw_vz = -20.0f;
+        if (raw_vz > 50.0f) raw_vz = 50.0f;
+        filtered_descent_rate = (filtered_descent_rate == 0.0f) ? raw_vz : (0.25f * raw_vz + 0.75f * filtered_descent_rate);
+    }
+
+    // Safety thermal cutoff for burnwire
+    if (burnwire_active && (now_ms - burnwire_start_ms >= BURNWIRE_MAX_DURATION_MS)) {
         burnwire_active = false;
     }
 
@@ -103,12 +108,9 @@ void FlightStateMachine::update(
             break;
 
         case FlightState::ASCENT:
-            // Drone drop detection:
-            // The drone ascends smoothly. When dropped:
-            // 1) Peak altitude is at least 30m (so ground handling doesn't trigger it)
-            // 2) CanSat has dropped at least 10m below peak altitude
-            // 3) If release is at or below PARAFOIL_DEPLOY_ALT (700m), immediately trigger deployment!
-            //    If release is above 700m (e.g. 800m-1000m), enter DROGUE_DESCENT until 700m.
+            // Drone drop / apogee release detection:
+            // When release occurs at or below 750m, immediately trigger deployment.
+            // When release occurs above 750m (e.g. 800m-1000m), fall in drogue until 750m.
             if (max_altitude >= 30.0f && alt_agl < (max_altitude - 10.0f)) {
                 if (alt_agl <= PARAFOIL_DEPLOY_ALT) {
                     transitionTo(FlightState::PARAFOIL_DEPLOYMENT, now_ms);
@@ -119,15 +121,25 @@ void FlightStateMachine::update(
             break;
 
         case FlightState::DROGUE_DESCENT:
-            // Reefed parachute descent: trigger disreefing when reaching 700m AGL
+            // Fast drogue descent (17 m/s): burnwire starts pulsing at 750m AGL
             if (alt_agl <= PARAFOIL_DEPLOY_ALT) {
                 transitionTo(FlightState::PARAFOIL_DEPLOYMENT, now_ms);
             }
             break;
 
         case FlightState::PARAFOIL_DEPLOYMENT:
-            // Pulse burnwire for 30s before heading to precision guidance
-            if ((now_ms - state_entry_time_ms >= BURNWIRE_DURATION_MS) || alt_agl <= TOUCHDOWN_ALT) {
+            // 1. Burnwire pulses until descent velocity decreases by at least 3.0 m/s
+            if (burnwire_active) {
+                float vel_drop = deploy_trigger_vz - filtered_descent_rate;
+                if (vel_drop >= BURNWIRE_VEL_DROP_THRESH) {
+                    burnwire_active = false; // Deceleration achieved! Reefing line cut & canopy open
+                } else if (now_ms - burnwire_start_ms >= BURNWIRE_MAX_DURATION_MS) {
+                    burnwire_active = false; // Safety timeout cutoff
+                }
+            }
+
+            // 2. Start up servos and enter precision guidance when passing below 500m AGL
+            if (alt_agl <= SERVO_START_ALT || alt_agl <= TOUCHDOWN_ALT) {
                 burnwire_active = false;
                 transitionTo(FlightState::PRECISION_GUIDANCE, now_ms);
             }

@@ -22,11 +22,14 @@ public:
 
     float getMaxAltitude() const { return max_altitude; }
     float getBreakoutAltitude() const { return last_breakout_alt; }
+    float getDescentRate() const { return filtered_descent_rate; }
 
 private:
     FlightState current_state;
     float max_altitude;
     float last_altitude;
+    float filtered_descent_rate;
+    float deploy_trigger_vz;
     uint32_t state_entry_time_ms;
     uint32_t still_start_time_ms;
     uint32_t burnwire_start_ms;
