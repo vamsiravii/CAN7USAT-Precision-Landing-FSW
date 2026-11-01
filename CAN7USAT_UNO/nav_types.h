@@ -4,7 +4,7 @@
 #include <math.h>
 
 // ----------------------------------------------------------------------------
-// Local Cartesian and GPS Coordinates
+// Local Cartesian Coordinates (origin = launch-pad GNSS fix)
 // ----------------------------------------------------------------------------
 struct LocalPoint {
     float x; // East [m]
@@ -14,39 +14,18 @@ struct LocalPoint {
     LocalPoint(float _x, float _y) : x(_x), y(_y) {}
 };
 
-struct GPSPoint {
-    double lat; // Decimal degrees
-    double lon;
-
-    GPSPoint() = default;
-    GPSPoint(double _lat, double _lon) : lat(_lat), lon(_lon) {}
-};
-
 // ----------------------------------------------------------------------------
-// Guidance & Control Enums
-// ----------------------------------------------------------------------------
-enum class LoiterDirection {
-    CLOCKWISE = 1,
-    COUNTER_CLOCKWISE = -1
-};
-
-enum class LoiterPhase {
-    ORBIT_CAPTURE,
-    ORBIT_TRACKING
-};
-
-// ----------------------------------------------------------------------------
-// Mission Flight Phases
+// Mission Flight Phases (numeric values are telemetered - do not renumber)
 // ----------------------------------------------------------------------------
 enum class FlightState : uint8_t {
     BOOT = 0,
     LAUNCH_PAD = 1,
-    ASCENT = 2,
-    DROGUE_DESCENT = 3,         // Reefed parachute descent at ~17 m/s (1000m -> 600m)
-    PARAFOIL_DEPLOYMENT = 4,    // 600m burnwire disreefing & 2s inflation
-    PRECISION_GUIDANCE = 5,     // Waypoint progression to target area
-    TERMINAL_GUIDANCE = 6,      // 30m loiter holding orbit over target
-    FINAL_APPROACH = 7,         // Dynamic breakout direct glide to target
+    ASCENT = 2,                 // Carried up by the drone
+    DROGUE_DESCENT = 3,         // Drogue only, ~16 m/s (release -> ~625 m)
+    PARAFOIL_DEPLOYMENT = 4,    // Burnwire cut, canopy inflation & settling
+    PRECISION_GUIDANCE = 5,     // Homing toward the target
+    TERMINAL_GUIDANCE = 6,      // Energy management: loiter + downwind leg
+    FINAL_APPROACH = 7,         // Final leg into the target (S-turns burn excess height)
     LANDING = 8,                // Ground contact / Touchdown
     FAILSAFE = 9                // Emergency recovery
 };
@@ -68,7 +47,7 @@ inline const char* getFlightStateName(FlightState s) {
 }
 
 // ----------------------------------------------------------------------------
-// Guidance Results
+// Wind-triangle result (crab angle for a desired ground course)
 // ----------------------------------------------------------------------------
 struct WindCompResult {
     float heading_deg;
@@ -79,34 +58,35 @@ struct WindCompResult {
     bool feasible;
 };
 
-struct GuidanceOutput {
-    float steering;                   // Commanded steering [-1.0, +1.0]
-    float desired_bearing;            // Course to waypoint [deg]
-    float heading_error;              // Signed error [deg]
-    float distance_to_waypoint;       // Meters
-    int waypoint_number;              // 1-indexed
-    bool waypoint_reached;
-    bool target_reached;
-    bool final_approach;
-    float desired_heading;            // Crab-corrected heading [deg]
-    float crab_angle;
-    bool wind_feasible;
+// ----------------------------------------------------------------------------
+// One 10 Hz snapshot of the sensors, already converted to engineering units.
+// Filled by the Arduino sketch (or by the SIL harness) and passed to GncCore.
+// ----------------------------------------------------------------------------
+struct GncSensors {
+    uint32_t now_ms;
+
+    bool baro_valid;
+    float baro_alt_agl;      // Filtered barometric altitude above the launch pad [m]
+
+    bool gyro_valid;
+    float yaw_rate_dps;      // Mean yaw rate over the last tick, + = clockwise seen from above [deg/s]
+
+    bool gnss_new;           // A new PVT solution arrived since the previous tick
+    bool gnss_valid;         // 3D fix, enough satellites and a launch origin exists
+    float gnss_x;            // East of launch origin [m]
+    float gnss_y;            // North of launch origin [m]
+    float gnss_vn;           // Ground velocity North [m/s]
+    float gnss_ve;           // Ground velocity East [m/s]
+    float gnss_vd;           // Velocity Down [m/s]
 };
 
-struct BreakoutGeometry {
-    float radial_distance;
-    float target_bearing;
-    float heading_error;
-    float turn_angle;
-    float turn_direction;             // +1.0 for CW, -1.0 for CCW
-    float turn_radius;
-    float turn_duration;
-    float turn_arc_length;
-    LocalPoint turn_endpoint;
-    float straight_distance;
-    float required_path_length;
-    float glide_ratio;
-    float minimum_required_altitude;
-    float breakout_altitude;
-    bool feasible;
+// ----------------------------------------------------------------------------
+// Actuator demands produced by GncCore every tick.
+// ----------------------------------------------------------------------------
+struct GncOutputs {
+    float steering;          // [-1, +1], + = right brake = turn right (clockwise)
+    bool steering_enabled;
+    bool burnwire;
+    bool flywheel;
+    bool buzzer;
 };

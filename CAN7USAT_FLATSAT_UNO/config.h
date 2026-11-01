@@ -24,7 +24,7 @@
 //   Actuators & Analog (IDENTICAL on Uno & Mega 2560):
 //     Pin 2             -> Right Parafoil Brake Servo (Emax ES3004)
 //     Pin 3             -> Left Parafoil Brake Servo (Emax ES3004)
-//     Pin 4             -> XY-MOS MOSFET #1 (Nichrome Burnwire @ 700m, 30.0s)
+//     Pin 4             -> XY-MOS MOSFET #1 (Nichrome Burnwire: line parts at 600 m, OFF once canopy open)
 //     Pin 5             -> XY-MOS MOSFET #2 (Recovery Audio Beacon Buzzer @ Landing)
 //     Pin 6             -> Readytosky MT2204 2300KV Flywheel ESC (6000 RPM)
 //     Pin A0            -> Battery Voltage Divider (150k top / 47k bottom)
@@ -113,12 +113,24 @@
 #ifndef SERVO_USE_STANDARD_POSITIONAL
 #define SERVO_USE_STANDARD_POSITIONAL         1         // 1 = Standard 0-180 deg ES3004 Servos; 0 = Continuous Spools
 #endif
-#define SERVO_NEUTRAL_ANGLE                   90.0f     // 90 deg = No brake applied (1500 us)
-#define SERVO_MAX_BRAKE_ANGLE                 0.0f      // 0 deg  = Full brake pulled (500 us)
 #define ES3004_MIN_PULSE_US                   500       // Emax ES3004 0 deg pulse width (us)
 #define ES3004_NEUTRAL_PULSE_US               1500      // Emax ES3004 90 deg pulse width (us)
 #define ES3004_MAX_PULSE_US                   2400      // Emax ES3004 180 deg pulse width (us)
-#define BURNWIRE_DURATION_MS                  30000UL   // 30.0s XY-MOS pulse to melt nichrome line
+
+// Brake-line travel.  Pull per side = drum radius x servo rotation (rad).
+// The glued M4 screw (r ~ 2 mm) gives only ~3 mm of pull over 90 deg, which
+// cannot turn this canopy.  Fit a flanged drum (~30-40 mm diameter) and use the
+// servo's FULL travel so each side pulls ~40-60 mm.  Then calibrate on the
+// bench: NEUTRAL = line just taut (no trailing-edge deflection), FULL = the
+// pulse that gives the maximum pull.  Swap the two numbers if the drum winds
+// the wrong way.  The defaults below reproduce the old 1500 -> 500 us mapping.
+#define BRAKE_LEFT_NEUTRAL_US                 1500
+#define BRAKE_LEFT_FULL_US                    500
+#define BRAKE_RIGHT_NEUTRAL_US                1500
+#define BRAKE_RIGHT_FULL_US                   500
+#define SERVO_NEUTRAL_HOLD_MS                 800UL     // keep driving neutral this long before releasing PWM (ground states only)
+
+#define BURNWIRE_DURATION_MS                  30000UL   // Maximum burnwire ON time (switched off as soon as the canopy is open)
 
 // Readytosky MT2204 2300KV Brushless Motor + 30A 2S ESC (Z-Axis Momentum Bias Wheel)
 #define FLYWHEEL_MOTOR_KV         2300.0f
@@ -135,49 +147,100 @@
 #define BARO_EMA_ALPHA            0.4f
 #define BARO_CALIB_SAMPLES        50
 #define LAUNCH_DETECT_ALT         15.0f
-#define MIN_APOGEE_ALT            750.0f
-#define APOGEE_DROP_THRESH        20.0f
-#define PARAFOIL_DEPLOY_ALT       750.0f    // Burnwire deployment trigger altitude (750m AGL)
-#define SERVO_START_ALT           500.0f    // Servos start up & precision guidance begins (500m AGL)
-#define BURNWIRE_VEL_DROP_THRESH  3.0f      // Burnwire pulses until descent velocity decreases by 3.0 m/s
-#define BURNWIRE_MAX_DURATION_MS  30000UL   // 30.0s max thermal safety pulse cutoff
-#define BURNWIRE_DURATION_MS      BURNWIRE_MAX_DURATION_MS
-#define FINAL_APPROACH_ALT        120.0f
-#define FINAL_APPROACH_RADIUS     100.0f
-#define TERMINAL_MARGIN           100.0f
-#define TERMINAL_CAPTURE_RADIUS   200.0f
-#define LOITER_RADIUS             30.0f
-#define LOITER_CAPTURE_TOL        5.0f
-#define BREAKOUT_ALT_MARGIN       2.0f
+#define RELEASE_MIN_PEAK_ALT      30.0f     // Must have been carried at least this high
+#define RELEASE_DROP_ALT          10.0f     // ...and be this far below the peak
+#define RELEASE_FALL_RATE         6.0f      // ...and falling faster than this [m/s] (a drone never descends this fast)
+
+// Secondary (parafoil) deployment.  The rules require activation at 600 +/- 10 m.
+// The burnwire is switched on early by (drogue speed x cut time) so that the
+// line parts at 600 m.  MEASURE BURNWIRE_CUT_TIME_S on the bench (MOSFET ON ->
+// line parted) with the flight battery.  The drogue speed is measured in flight.
+#define PARAFOIL_DEPLOY_ALT       750.0f    // burnwire ON at 750m AGL
+#define SERVO_START_ALT           500.0f    // servos power on and precision guidance begins at 500m AGL
+#define BURNWIRE_VEL_DROP_THRESH  3.0f      // burnwire pulses until descent rate drops by >= 3.0 m/s
+#define SECONDARY_DEPLOY_ALT      600.0f
+#define BURNWIRE_CUT_TIME_S       1.5f
+#define BARO_LAG_S                0.2f      // pressure EMA + 10 Hz tick delay (compensated in the trigger)
+#define DROGUE_DESCENT_RATE       15.8f     // Predicted: drogue CdS ~0.075 m^2, 1.08 kg (replaced by measurement)
+#define FAST_FALL_RATE            9.0f      // Seen falling faster than this => real drop (not a bench test)
+#define INFLATION_SINK_RATE       7.0f      // Sink below this for INFLATION_CONFIRM_MS => canopy is open
+#define INFLATION_CONFIRM_MS      1000UL
+#define CANOPY_SETTLE_MS          3000UL    // Let the canopy/pendulum settle before steering
+#define DEPLOY_TIMEOUT_MS         30000UL   // Fallback: start guidance even if inflation was not detected
+
 #define TOUCHDOWN_ALT             2.0f
+#define TOUCHDOWN_STILL_ALT       8.0f      // Stillness check covers baro drift of a few metres
+#define TOUCHDOWN_STILL_RATE      0.3f
 #define TOUCHDOWN_STILL_TIME_MS   4000
 
 // ----------------------------------------------------------------------------
-// Aerodynamic Model (Frozen Baseline - Candidate A)
+// Aerodynamic START values (physics estimate for 1.08 kg under the 0.86 m^2
+// Clark-Y canopy with the drogue still attached).  The flight software
+// re-estimates airspeed, wind and sink rate in flight; these only seed it.
 // ----------------------------------------------------------------------------
-#define FORWARD_AIRSPEED          8.0f
-#define PARAFOIL_DESCENT_RATE     2.5f
-#define DROGUE_DESCENT_RATE       17.0f
-#define MAX_TURN_RATE_DEG_S       30.0f
+#define AIRSPEED_INIT             6.0f      // Horizontal airspeed [m/s] (old value 8.0 was too high)
+#define SINK_STRAIGHT_INIT        2.8f      // Sink rate, straight flight [m/s]
+#define SINK_TURN_INIT            3.1f      // Sink rate while turning ~15-20 deg/s [m/s]
+#define SINK_TURN_RATE_SPLIT      8.0f      // |yaw rate| above this counts as "turning" [deg/s]
+#define SINK_EMA_ALPHA            0.01f     // per 10 Hz tick (~10 s time constant)
+#define DROGUE_WIND_EMA_ALPHA     0.2f      // per GNSS fix while under the drogue
+
+// Wind + airspeed from a circle fit to GNSS ground-velocity samples (needs turning)
+#define WIND_FIT_FORGET           0.993f    // per GNSS sample (5 Hz -> ~30 s memory)
+#define WIND_FIT_MIN_SPREAD       0.2f      // min velocity-cloud variance / AIRSPEED_INIT^2 (~ >230 deg of circle)
+#define WIND_FIT_MIN_AIRSPEED     3.5f
+#define WIND_FIT_MAX_AIRSPEED     10.0f
 
 // ----------------------------------------------------------------------------
-// Guidance & Control (PID in Radian Domain)
+// Heading controller.  Heading = direction of (GNSS ground velocity - wind
+// estimate), smoothed with the gyro.  Steering heading (not ground track)
+// keeps the loop gain constant in any wind; the desired heading includes the
+// wind-triangle crab, so errors in the wind estimate largely cancel.
 // ----------------------------------------------------------------------------
-#define PID_KP                    10.0f
-#define PID_KI                    0.1f
-#define PID_KD                    0.5f
-#define PID_INTEGRAL_LIMIT        10.0f
-#define WIND_EMA_ALPHA            0.05f
+#define HDG_K                     0.8f      // commanded turn rate per heading error [1/s]
+#define TURN_RATE_CMD_MAX         20.0f     // turn-rate limit used by guidance [deg/s]
+#define TURN_AUTH_NOM             35.0f     // steady turn rate at full steering [deg/s] - MEASURE in a drop test
+#define RATE_K                    0.5f      // rate-loop proportional gain (dimensionless)
+#define RATE_KI                   0.5f      // rate-loop integral gain [1/s]: absorbs rigging asymmetry, slack, authority error
+#define RATE_I_LIMIT              0.4f      // integral authority limit (fraction of full steering)
+#define PSI_GNSS_GAIN             0.1f      // heading correction per GNSS fix (5 Hz -> ~2 s time constant)
+#define PSI_MIN_AIRVEL            2.0f      // need |v - wind| above this to correct the heading [m/s]
+#define CRS_TRIM_KI               0.05f     // ground-track trim: heading offset per course error [1/s]
+#define CRS_TRIM_MAX_DEG          60.0f     // ...limited to this (covers a badly wrong wind estimate)
+#define CRS_TRIM_MIN_GS           1.0f      // only trim when the ground course is measurable [m/s]
+#define SEED_WIND_MAX_FRAC        0.9f      // un-fitted (drogue) wind is capped at this x airspeed
+#define NAV_LOST_STEERING         0.3f      // gentle circle while GNSS is lost (stay near the area)
+#define GNSS_TIMEOUT_MS           2500UL
+#define GNSS_LATENCY_S            0.10f     // PVT output latency compensated by forward propagation
+#define GNSS_MIN_SATS             5
+#define GNSS_MEAS_RATE_MS         200       // 5 Hz navigation rate (was 1 Hz)
+
+// ----------------------------------------------------------------------------
+// Precision guidance (homing -> loiter -> downwind leg -> final with S-turns)
+// ----------------------------------------------------------------------------
+#define LOITER_RADIUS             25.0f     // [m] (needs ~14 deg/s at 6 m/s)
+#define LOITER_DIRECTION          1         // +1 = clockwise (right turns), -1 = counter-clockwise
+#define LOITER_LOOKAHEAD          12.0f     // [m] radial-error lookahead
+#define LOITER_ENTRY_MARGIN       20.0f     // start loitering within R + this of the target [m]
+#define LOITER_MIN_EXCESS_ALT     25.0f     // only loiter if this much height is spare [m]
+#define LOITER_FLOOR_ALT          35.0f     // never loiter below this [m]
+#define ARRIVAL_ALT_BIAS          6.0f      // aim to reach the target this high; S-turns burn it off [m]
+#define DOWNWIND_ALIGN_DEG        20.0f     // leave the loiter within this of the downwind course
+#define CALM_WIND_SPEED           0.7f      // below this the approach direction does not matter [m/s]
+#define LINE_LOOKAHEAD            15.0f     // straight-leg cross-track lookahead [m]
+#define FINAL_WEAVE_MAX_DEG       60.0f     // max S-turn offset from the target bearing
+#define FINAL_WEAVE_XTRACK        10.0f     // S-turn half-width [m]
+#define FINAL_WEAVE_MIN_DIST      15.0f     // stop S-turning inside this distance [m]
 
 // ----------------------------------------------------------------------------
 // Target Location (Default Hardcoded Coordinates: 26.717535° N, 84.301543° E)
 // ----------------------------------------------------------------------------
 #define DEFAULT_TARGET_LAT        26.717535
 #define DEFAULT_TARGET_LON        84.301543
-#define TARGET_DEFAULT_EAST       1200.0f
+#define DEFAULT_TARGET_LAT_E7     267175350L
+#define DEFAULT_TARGET_LON_E7     843015430L
+#define TARGET_DEFAULT_EAST       0.0f
 #define TARGET_DEFAULT_NORTH      0.0f
-#define NUM_WAYPOINTS             10
-#define WAYPOINT_ACCEPTANCE_RAD   25.0f
 
 // ----------------------------------------------------------------------------
 // Loop Frequencies

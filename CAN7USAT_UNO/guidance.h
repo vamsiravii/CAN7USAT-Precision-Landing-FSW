@@ -1,144 +1,101 @@
 #pragma once
 
+#include <stdint.h>
 #include "nav_types.h"
 #include "config.h"
 
+// ============================================================================
+// Guidance sub-modes (telemetered through the FlightState they map to):
+//   HOMING   -> PRECISION_GUIDANCE  fly the ground track straight at the target
+//   LOITER   -> TERMINAL_GUIDANCE   circle the target to burn excess height and
+//                                   measure wind/airspeed (circle fit)
+//   DOWNWIND -> TERMINAL_GUIDANCE   leave the circle downwind; turn back when the
+//                                   predicted arrival height drops to the bias
+//   FINAL    -> FINAL_APPROACH      fly into the wind to the target; S-turns
+//                                   burn any remaining excess height
+// ============================================================================
+enum class GuidanceMode : uint8_t {
+    HOMING = 0,
+    LOITER = 1,
+    DOWNWIND = 2,
+    FINAL = 3
+};
+
+struct GuidanceInputs {
+    float x, y;              // East / North of launch origin [m]
+    float alt;               // above launch pad [m]
+    float ve, vn;            // ground velocity [m/s]
+    float heading_deg;       // air-relative heading estimate [deg]
+    bool heading_valid;
+    float yaw_rate_dps;      // + = clockwise
+    bool nav_valid;          // GNSS fresh
+    float wind_e, wind_n;    // wind the air moves toward [m/s]
+    float airspeed;          // horizontal airspeed [m/s]
+    float sink_straight;     // [m/s]
+    float sink_turn;         // [m/s]
+    bool wind_known;         // circle fit converged or drogue drift seeded
+    bool wind_fitted;        // wind/airspeed come from the circle fit (trusted)
+    float dt;
+    uint32_t now_ms;
+};
+
 // ----------------------------------------------------------------------------
-// Wind Estimator (Exponential Moving Average)
+// Heading controller: heading error -> commanded turn rate (limited to
+// TURN_RATE_CMD_MAX so turns are predictable) -> steering.  The inner
+// turn-rate loop uses the gyro (P + I); the integral absorbs rigging
+// asymmetry, brake-line slack and steering-authority error.
 // ----------------------------------------------------------------------------
-class WindEstimator {
+class HeadingController {
 public:
-    WindEstimator(float alpha = WIND_EMA_ALPHA);
     void reset();
-    void update(float raw_wx, float raw_wy);
-
-    float getWindX() const { return wind_x; }
-    float getWindY() const { return wind_y; }
+    // forced_dir: 0 = turn the short way; +1/-1 = keep turning right/left while |error| > 90 deg
+    float update(float desired_heading_deg, float heading_deg, float yaw_rate_dps,
+                 float rate_ff_dps, int8_t forced_dir, float dt);
+    float lastError() const { return last_err; }
+    float rateIntegral() const { return integ; }
 
 private:
-    float alpha;
-    float wind_x;
-    float wind_y;
-    bool initialized;
+    float integ;
+    float last_err;
 };
 
-// ----------------------------------------------------------------------------
-// Radian-Domain PID Controller
-// ----------------------------------------------------------------------------
-class PIDController {
+class PrecisionGuidance {
 public:
-    PIDController(
-        float kp = PID_KP,
-        float ki = PID_KI,
-        float kd = PID_KD,
-        float out_min = -1.0f,
-        float out_max = 1.0f,
-        float int_min = -PID_INTEGRAL_LIMIT,
-        float int_max = PID_INTEGRAL_LIMIT
-    );
-
     void reset();
-    float update(float error_rad, float dt);
+    void setTarget(float x, float y);
+    float update(const GuidanceInputs& in);      // returns steering [-1, +1]
+    void syncToFlightState(FlightState st, const GuidanceInputs& in);
+
+    GuidanceMode mode() const { return mode_; }
+    FlightState flightState() const;
+    float turnRatePlanDps() const;
+
+    // Logged for post-flight analysis
+    float desiredCourse;
+    float desiredHeading;
+    float predictedArrivalAlt;
+    float distToTarget;
 
 private:
-    float kp, ki, kd;
-    float output_min, output_max;
-    float integral_min, integral_max;
-    float integral;
-    float previous_error;
-    bool initialized;
+    void enterFinal(const GuidanceInputs& in, int8_t turn_dir);
+    void enterDownwind(const GuidanceInputs& in, float leg_course);
+    float straightArrivalAlt(const GuidanceInputs& in) const;
+    float predictTurnThenFinal(const GuidanceInputs& in, int8_t dir) const;
+
+    LocalPoint target;
+    GuidanceMode mode_;
+    HeadingController ctrl;
+    int8_t forced_dir;
+    float crs_trim;          // heading offset learned from the actual ground track [deg]
+    bool had_fit;            // circle-fit wind seen before (reset the trim when it first arrives)
+
+    uint32_t last_pass_ms;
+    float last_pass_alt;
+    bool have_pass;
+
+    float leg_course;
+    float leg_x0, leg_y0;
+
+    float final_axis;
+    int8_t weave_sign;
 };
-
-// ----------------------------------------------------------------------------
-// Sequential Waypoint Manager
-// ----------------------------------------------------------------------------
-class WaypointManager {
-public:
-    WaypointManager();
-    void init(const LocalPoint& start, const LocalPoint& target, int num_pts = NUM_WAYPOINTS, float radius = WAYPOINT_ACCEPTANCE_RAD);
-    void reset();
-    bool update(const LocalPoint& current_pos);
-    void skipToFinalTarget();
-
-    LocalPoint getCurrentWaypoint() const;
-    LocalPoint getTarget() const { return target_pt; }
-    int getCurrentIndex() const { return current_idx; }
-    int getTotalWaypoints() const { return total_pts; }
-    bool isComplete() const { return current_idx >= total_pts; }
-
-private:
-    LocalPoint waypoints[NUM_WAYPOINTS];
-    uint8_t total_pts;
-    uint8_t current_idx;
-    float acceptance_radius;
-    LocalPoint target_pt;
-};
-
-// ----------------------------------------------------------------------------
-// Guidance Controller (En-Route Waypoint Navigation)
-// ----------------------------------------------------------------------------
-class GuidanceController {
-public:
-    GuidanceController(WaypointManager* wm, PIDController* pid);
-    void setWind(float wx, float wy) { wind_x = wx; wind_y = wy; }
-    void reset();
-    GuidanceOutput update(const LocalPoint& position, float heading, float altitude, float dt);
-
-private:
-    WaypointManager* waypoint_manager;
-    PIDController* pid;
-    float wind_x;
-    float wind_y;
-};
-
-// ----------------------------------------------------------------------------
-// Loiter Holding Orbit Guidance (Terminal Energy Dissipation)
-// ----------------------------------------------------------------------------
-class LoiterGuidance {
-public:
-    LoiterGuidance();
-    void setCenter(const LocalPoint& c) { center = c; }
-    void setWind(float wx, float wy) { wind_x = wx; wind_y = wy; }
-    void setDirection(LoiterDirection dir) { direction = dir; }
-
-    float update(const LocalPoint& position, float current_heading);
-
-    float getRadialDistance() const { return radial_dist; }
-    float getRadialError() const { return radial_err; }
-    LoiterPhase getPhase() const { return phase; }
-    float getDesiredHeading() const { return desired_hdg; }
-
-private:
-    LocalPoint center;
-    float radius;
-    LoiterDirection direction;
-    float capture_tolerance;
-    float forward_speed;
-    float max_turn_rate;
-    float wind_x;
-    float wind_y;
-
-    float radial_dist;
-    float radial_err;
-    float desired_hdg;
-    LoiterPhase phase;
-};
-
-// ----------------------------------------------------------------------------
-// Energy Check & Dynamic Breakout Guidance
-// ----------------------------------------------------------------------------
-bool shouldEnterTerminalGuidance(
-    float altitude,
-    float target_distance,
-    float wind_x,
-    float wind_y,
-    float desired_course_deg
-);
-
-BreakoutGeometry calculateBreakoutGeometry(
-    const LocalPoint& position,
-    float heading,
-    const LocalPoint& target,
-    float wind_x,
-    float wind_y
-);

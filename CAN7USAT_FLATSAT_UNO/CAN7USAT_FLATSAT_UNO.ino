@@ -11,21 +11,23 @@
 #define HAS_SD_LOGGER 0
 #endif
 
+#if defined(__AVR_ATmega328P__)
+#error "CAN-7USAT FSW needs an Arduino Mega 2560: the Uno has too little flash for the GNC code and no SD logging (rule 5.1.xi requires onboard SD storage)."
+#endif
+
 #include "config.h"
 #include "nav_types.h"
 #include "nav_math.h"
-#include "ekf.h"
-#include "guidance.h"
-#include "flight_sm.h"
+#include "gnc.h"
 #include "actuators.h"
 
 // ============================================================================
-// CAN-7USAT Team 017 | Arduino Uno (ATmega328P) FlatSat Interactive FSW
+// CAN-7USAT Team 017 | Arduino Uno (ATmega328P) Flight Software
 // ----------------------------------------------------------------------------
 // Sensors on I2C (Uno A4 = SDA, A5 = SCL, powered from 3.3V!):
 //   1. MS5611 Barometer  (0x77 / 0x76)
 //   2. MPU6050 6-DOF IMU (0x68 / 0x69)
-//   3. NEO-M9N GNSS      (0x42 DDC/I2C NMEA)
+//   3. NEO-M9N GNSS      (0x42 DDC/I2C NMEA + UBX)
 // Actuators:
 //   - Pin 2: Right Parafoil Brake Servo (Emax ES3004)
 //   - Pin 3: Left Parafoil Brake Servo (Emax ES3004)
@@ -33,7 +35,7 @@
 //   - Pin 5: Recovery Buzzer XY-MOS MOSFET #2 (500ms beacon @ Landing)
 //   - Pin 6: Readytosky MT2204 2300KV Flywheel ESC (6000 RPM / 1353 us)
 //   - Pin A0: Battery Voltage Divider (150k top / 47k bottom)
-//   - Pin 0 (RX) / Pin 1 (TX): USB Serial Console & Ra-08H LoRa (115200 baud)
+//   - Pin 0 (RX) / Pin 1 (TX): Ra-08H LoRa Transceiver (115200 baud)
 // ============================================================================
 
 static uint8_t baroI2CAddr = 0x77;
@@ -42,8 +44,8 @@ static uint8_t mpuI2CAddr = MPU6050_I2C_ADDR_PRIMARY;
 static uint8_t mpuWhoAmI = 0x00;
 static bool mpuUpsideDown = MPU_MOUNTED_UPSIDE_DOWN;
 static bool mpuCalibrated = false;
-static float gyroBiasZ = 0.0f;
-static float accelBiasX = 0.0f, accelBiasY = 0.0f, accelBiasZ = 0.0f;
+static float gyroBiasX = 0.0f, gyroBiasY = 0.0f, gyroBiasZ = 0.0f;   // deg/s
+static float accelBiasX = 0.0f, accelBiasY = 0.0f, accelBiasZ = 0.0f; // m/s^2
 static float rawIntegratedYawDeg = 0.0f;
 static uint32_t lastImuPollUs = 0;
 
@@ -60,16 +62,11 @@ uint32_t sdRecordCount = 0;
 uint32_t lastSdLogMs = 0;
 #endif
 
-// Navigation & Estimation
-ExtendedKalmanFilter ekf;
-WindEstimator windEstimator;
-PIDController pid(PID_KP, PID_KI, PID_KD, -1.0f, 1.0f, -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
-WaypointManager waypointManager;
-GuidanceController guidanceController(&waypointManager, &pid);
-LoiterGuidance loiterGuidance;
+// Guidance, Navigation & Control core (shared with the ../sil simulator)
+GncCore gnc;
+FlightStateMachine& flightSM = gnc.sm;
 
-// Flight Management & Actuators
-FlightStateMachine flightSM;
+// Actuators
 ActuatorManager actuators;
 
 // Barometer Calibration & Filtering State Variables
@@ -78,20 +75,20 @@ float filteredPressure = 1013.25f;
 const float EMA_ALPHA = BARO_EMA_ALPHA;
 float groundAlt = 0.0f;
 
-// Navigation & Timing State Variables
-GPSPoint launchGPS(0.0, 0.0);
+// Navigation & Timing State Variables (raw UBX integers, 1e-7 deg: exact on AVR)
+int32_t launchLatE7 = 0, launchLonE7 = 0;
+float launchCosLat = 1.0f;
 bool launchGPSFixed = false;
-GPSPoint targetGPS(DEFAULT_TARGET_LAT, DEFAULT_TARGET_LON);
+int32_t targetLatE7 = DEFAULT_TARGET_LAT_E7, targetLonE7 = DEFAULT_TARGET_LON_E7;
 bool targetGPSConfigured = true;
 LocalPoint targetLocal(TARGET_DEFAULT_EAST, TARGET_DEFAULT_NORTH);
+float lastYawForRateDeg = 0.0f;
 
-// FlatSat Interactive Control Flags
-bool telemetryEnabled = false;     // Off by default in FlatSat so Serial Monitor stays clean; toggle with 't' or 'START'
+// LoRa Telecommand & Telemetry Gating State
+bool telemetryEnabled = false; // Auto-starts on ASCENT or via Ground Station "START" command
 bool telemAscentTriggered = false;
-bool manualStateHold = true;       // True by default in FlatSat so user can step states 1-8
+bool manualStateHold = false;
 bool manualSteeringOverride = false;
-bool directServoPulseMode = false; // True when user triggers 'u' (Unwind), 'x' (Brake), or 'd' (Detach)
-uint16_t directServoPulseUs = 0;
 float overrideSteeringVal = 0.0f;
 bool lastBurnwirePinState = false;
 char cmdBuf[80];
@@ -113,42 +110,17 @@ float activeHeadingOffsetDeg = IMU_HEADING_OFFSET_DEG;
 
 char gnssTimeStr[12] = "00:00:00";
 double gnssLat = 0.0, gnssLon = 0.0;
+int32_t gnssLatE7 = 0, gnssLonE7 = 0;
 float gnssAltMSL = 0.0f;
-float gnssVelEast = 0.0f, gnssVelNorth = 0.0f;
+float gnssVelEast = 0.0f, gnssVelNorth = 0.0f, gnssVelDown = 0.0f;
 int gnssSats = 0;
-static uint32_t gnssRxBytes = 0;
+uint8_t gnssFixType = 0;
 
 // ============================================================================
-// Lightweight Direct u-blox NEO-M9N I2C (0x42) Driver
+// Lightweight Direct u-blox NEO-M9N I2C (0x42) Driver (Zero Library Overhead)
+// Reads standard NMEA ($GNGGA / $GPGGA and $GNRMC / $GPRMC) over u-blox DDC
 // ============================================================================
 #define UBLOX_I2C_ADDR 0x42
-
-static float parseDecimalFloat(const char* s) {
-    if (!s) return 0.0f;
-    while (*s == ' ') s++;
-    float sign = 1.0f;
-    if (*s == '-') { sign = -1.0f; s++; }
-    else if (*s == '+') { s++; }
-
-    float val = 0.0f;
-    while (*s >= '0' && *s <= '9') {
-        val = val * 10.0f + (float)(*s - '0');
-        s++;
-    }
-    if (*s == '.') {
-        s++;
-        float scale = 0.1f;
-        while (*s >= '0' && *s <= '9') {
-            val += (float)(*s - '0') * scale;
-            scale *= 0.1f;
-            s++;
-        }
-    }
-    return val * sign;
-}
-
-
-
 
 // ============================================================================
 // UBX Binary (UBX-NAV-PVT) & NMEA Stream Decoders
@@ -159,7 +131,7 @@ static uint8_t ubxClass = 0, ubxId = 0;
 static uint16_t ubxLen = 0, ubxPos = 0;
 static uint8_t ubxCkA = 0, ubxCkB = 0;
 static uint8_t pvtHour = 0, pvtMin = 0, pvtSec = 0, pvtFix = 0, pvtSats = 0;
-static int32_t pvtLat = 0, pvtLon = 0, pvtHmsl = 0, pvtVelN = 0, pvtVelE = 0;
+static int32_t pvtLat = 0, pvtLon = 0, pvtHmsl = 0, pvtVelN = 0, pvtVelE = 0, pvtVelD = 0;
 
 static void format2Digits(char* dst, uint8_t v) {
     dst[0] = '0' + (v / 10);
@@ -204,6 +176,7 @@ static bool parseUbxByte(uint8_t b) {
             else if (ubxPos >= 36 && ubxPos <= 39) p = (uint8_t*)&pvtHmsl + (ubxPos - 36);
             else if (ubxPos >= 48 && ubxPos <= 51) p = (uint8_t*)&pvtVelN + (ubxPos - 48);
             else if (ubxPos >= 52 && ubxPos <= 55) p = (uint8_t*)&pvtVelE + (ubxPos - 52);
+            else if (ubxPos >= 56 && ubxPos <= 59) p = (uint8_t*)&pvtVelD + (ubxPos - 56);
             if (p) *p = b;
         }
         if (++ubxPos >= ubxLen) ubxStep = 7;
@@ -213,6 +186,7 @@ static bool parseUbxByte(uint8_t b) {
     } else if (ubxStep == 8) {
         if (b == ubxCkB && ubxClass == 0x01 && ubxId == 0x07) {
             gnssSats = pvtSats;
+            gnssFixType = pvtFix;
             format2Digits(gnssTimeStr, pvtHour);
             gnssTimeStr[2] = ':';
             format2Digits(gnssTimeStr + 3, pvtMin);
@@ -220,17 +194,47 @@ static bool parseUbxByte(uint8_t b) {
             format2Digits(gnssTimeStr + 6, pvtSec);
             gnssTimeStr[8] = '\0';
             if (pvtFix >= 2) {
+                gnssLatE7 = pvtLat;
+                gnssLonE7 = pvtLon;
                 gnssLat = (double)pvtLat * 1e-7;
                 gnssLon = (double)pvtLon * 1e-7;
                 gnssAltMSL = (float)pvtHmsl * 0.001f;
                 gnssVelNorth = (float)pvtVelN * 0.001f;
                 gnssVelEast = (float)pvtVelE * 0.001f;
+                gnssVelDown = (float)pvtVelD * 0.001f;
             }
             gotPvt = true;
         }
         ubxStep = (b == 0xB5) ? 1 : 0;
     }
     return gotPvt;
+}
+
+// UBX-CFG-VALSET (RAM layer) with a run-time Fletcher checksum.
+// Keys (u-blox M9 interface description):
+//   CFG-RATE-MEAS        0x30210001 U2  = GNSS_MEAS_RATE_MS (5 Hz)
+//   CFG-I2COUTPROT-NMEA  0x10720002 L   = 0  (UBX only: NMEA was wasting I2C bandwidth)
+//   CFG-NAVSPG-DYNMODEL  0x20110021 E1  = 6  (airborne <1 g)
+static void sendUbxValsetGnc() {
+    uint8_t m[8 + 4 + 6 + 5 + 5];
+    uint8_t n = 0;
+    m[n++] = 0xB5; m[n++] = 0x62; m[n++] = 0x06; m[n++] = 0x8A;
+    m[n++] = 0; m[n++] = 0;                         // length, patched below
+    m[n++] = 0x00; m[n++] = 0x01; m[n++] = 0x00; m[n++] = 0x00;   // version, RAM layer, reserved
+    m[n++] = 0x01; m[n++] = 0x00; m[n++] = 0x21; m[n++] = 0x30;   // CFG-RATE-MEAS
+    m[n++] = (uint8_t)(GNSS_MEAS_RATE_MS & 0xFF); m[n++] = (uint8_t)(GNSS_MEAS_RATE_MS >> 8);
+    m[n++] = 0x02; m[n++] = 0x00; m[n++] = 0x72; m[n++] = 0x10; m[n++] = 0x00;   // CFG-I2COUTPROT-NMEA = 0
+    m[n++] = 0x21; m[n++] = 0x00; m[n++] = 0x11; m[n++] = 0x20; m[n++] = 0x06;   // CFG-NAVSPG-DYNMODEL = 6
+    uint16_t len = n - 6;
+    m[4] = (uint8_t)(len & 0xFF);
+    m[5] = (uint8_t)(len >> 8);
+    uint8_t ckA = 0, ckB = 0;
+    for (uint8_t i = 2; i < n; i++) { ckA += m[i]; ckB += ckA; }
+    m[n++] = ckA;
+    m[n++] = ckB;
+    Wire.beginTransmission(UBLOX_I2C_ADDR);
+    Wire.write(m, n);
+    Wire.endTransmission();
 }
 
 static bool initGNSS() {
@@ -254,6 +258,10 @@ static bool initGNSS() {
     };
     sendUbxCmd(ubxCfgNavPvt, sizeof(ubxCfgNavPvt));
 
+    // 5 Hz navigation, UBX-only on I2C, airborne dynamic model
+    delay(20);
+    sendUbxValsetGnc();
+
     return true;
 }
 
@@ -261,6 +269,7 @@ __attribute__((noinline))
 static bool pollGNSS() {
     if (!gnssOK) return false;
 
+    // Read available byte count from u-blox DDC registers 0xFD (MSB) & 0xFE (LSB)
     Wire.beginTransmission(UBLOX_I2C_ADDR);
     Wire.write(0xFD);
     if (Wire.endTransmission(false) != 0) return false;
@@ -270,7 +279,7 @@ static bool pollGNSS() {
     uint8_t l = Wire.read();
     uint16_t avail = ((uint16_t)h << 8) | (uint16_t)l;
     if (avail == 0 || avail == 0xFFFF) return false;
-    if (avail > 64) avail = 64;
+    if (avail > 64) avail = 64; // Process up to 64 bytes per loop tick to keep loop fast
 
     bool updated = false;
     while (avail > 0) {
@@ -278,7 +287,6 @@ static bool pollGNSS() {
         if (Wire.requestFrom((uint8_t)UBLOX_I2C_ADDR, chunk) == 0) break;
         while (Wire.available()) {
             uint8_t b = (uint8_t)Wire.read();
-            gnssRxBytes++;
             if (parseUbxByte(b)) {
                 updated = true;
             }
@@ -289,16 +297,16 @@ static bool pollGNSS() {
 }
 
 // ============================================================================
-// MS5611-01BA03 High-Precision Barometer Driver (Direct I2C)
+// MS5611-01BA03 Direct Lightweight I2C Driver (0x77 / 0x76, OSR=4096)
 // ============================================================================
 static uint16_t readMS5611Prom(uint8_t addr, uint8_t reg) {
     Wire.beginTransmission(addr);
-    Wire.write(0xA0 | (reg << 1));
+    Wire.write(0xA0 + (reg * 2));
     if (Wire.endTransmission() != 0) return 0;
     if (Wire.requestFrom(addr, (uint8_t)2) < 2) return 0;
-    uint8_t msb = Wire.read();
-    uint8_t lsb = Wire.read();
-    return ((uint16_t)msb << 8) | (uint16_t)lsb;
+    uint8_t h = Wire.read();
+    uint8_t l = Wire.read();
+    return ((uint16_t)h << 8) | (uint16_t)l;
 }
 
 static uint32_t readMS5611ADC(uint8_t addr) {
@@ -374,6 +382,8 @@ float pressureToAlt(float hPa, float referenceHpa) {
     if (!isfinite(hPa) || hPa <= 0.0f || !isfinite(referenceHpa) || referenceHpa <= 0.0f) {
         return 0.0f;
     }
+    // 3rd-order barometric expansion of 44330 * (1 - (P/P0)^0.190295)
+    // Accurate to < 8 mm at 700m and < 4 cm at 1000m without pulling in powf/log/exp
     float d = 1.0f - (hPa / referenceHpa);
     float term = d * (0.19029496f + d * (0.07703989f + d * 0.04647892f));
     return 44330.0f * term;
@@ -415,6 +425,17 @@ void resetBatteryVoltage(uint16_t targetMv = 8200U) {
 // ============================================================================
 // MPU6050 6-DOF IMU Hardware Driver, Calibration & EEPROM Persistence
 // ============================================================================
+struct MPU6050_EEPROM_Data {
+    uint32_t magic;
+    float gyro_bias_x;
+    float gyro_bias_y;
+    float gyro_bias_z;
+    float accel_bias_x;
+    float accel_bias_y;
+    float accel_bias_z;
+    bool upside_down;
+};
+
 static bool writeMPURegister(uint8_t addr, uint8_t reg, uint8_t val) {
     Wire.beginTransmission(addr);
     Wire.write(reg);
@@ -427,20 +448,20 @@ static bool initMPU6050() {
     for (int i = 0; i < 2; i++) {
         uint8_t addr = addrs[i];
         Wire.beginTransmission(addr);
-        Wire.write(0x75);
+        Wire.write(0x75); // WHO_AM_I register
         if (Wire.endTransmission(false) == 0 && Wire.requestFrom(addr, (uint8_t)1) == 1) {
             mpuWhoAmI = Wire.read();
             mpuI2CAddr = addr;
 
-            writeMPURegister(mpuI2CAddr, 0x6B, 0x80);
+            writeMPURegister(mpuI2CAddr, 0x6B, 0x80); // Device Reset
             delay(50);
-            writeMPURegister(mpuI2CAddr, 0x6B, 0x01);
+            writeMPURegister(mpuI2CAddr, 0x6B, 0x01); // PWR_MGMT_1: PLL with X-axis gyro clock
             delay(20);
-            writeMPURegister(mpuI2CAddr, 0x6C, 0x00);
-            writeMPURegister(mpuI2CAddr, 0x19, 0x04);
-            writeMPURegister(mpuI2CAddr, 0x1A, 0x03);
-            writeMPURegister(mpuI2CAddr, 0x1B, 0x08);
-            writeMPURegister(mpuI2CAddr, 0x1C, 0x08);
+            writeMPURegister(mpuI2CAddr, 0x6C, 0x00); // PWR_MGMT_2: Enable all 6 axes
+            writeMPURegister(mpuI2CAddr, 0x19, 0x04); // SMPLRT_DIV: 200 Hz
+            writeMPURegister(mpuI2CAddr, 0x1A, 0x03); // CONFIG: DLPF = 42 Hz anti-vibration filter
+            writeMPURegister(mpuI2CAddr, 0x1B, 0x08); // GYRO_CONFIG: +/- 500 deg/s (65.5 LSB/deg/s)
+            writeMPURegister(mpuI2CAddr, 0x1C, 0x08); // ACCEL_CONFIG: +/- 4g (8192.0 LSB/g)
             delay(20);
             lastImuPollUs = micros();
             return true;
@@ -450,8 +471,9 @@ static bool initMPU6050() {
 }
 
 static bool readMPU6050Raw(int16_t outRaw[4]) {
+    // outRaw[0]=Ax, outRaw[1]=Ay, outRaw[2]=Az, outRaw[3]=Gz
     Wire.beginTransmission(mpuI2CAddr);
-    Wire.write(0x3B);
+    Wire.write(0x3B); // ACCEL_XOUT_H
     if (Wire.endTransmission(false) != 0) return false;
     if (Wire.requestFrom(mpuI2CAddr, (uint8_t)14) < 14) return false;
 
@@ -464,17 +486,6 @@ static bool readMPU6050Raw(int16_t outRaw[4]) {
     }
     return true;
 }
-
-struct MPU6050_EEPROM_Data {
-    uint32_t magic;
-    float gyro_bias_x;
-    float gyro_bias_y;
-    float gyro_bias_z;
-    float accel_bias_x;
-    float accel_bias_y;
-    float accel_bias_z;
-    bool upside_down;
-};
 
 bool loadMPU6050CalibFromEEPROM() {
     MPU6050_EEPROM_Data data;
@@ -558,9 +569,10 @@ void calibrateMPU6050(bool forceManual = false) {
 
         mpuUpsideDown = (meanAz < 0.0f);
         accelBiasZ = meanAz - (mpuUpsideDown ? -9.80665f : 9.80665f);
-        saveMPU6050CalibToEEPROM();
         mpuCalibrated = true;
-        Serial.println(F("ACK:CALIB=OK (SAVED)"));
+
+        saveMPU6050CalibToEEPROM(); // Persist forever
+        Serial.println(F("ACK:CALIB=SAVED_EEPROM"));
     }
     lastImuPollUs = micros();
 }
@@ -570,7 +582,7 @@ void pollMPU6050() {
     if (!imuOK) return;
     uint32_t nowUs = micros();
     uint32_t elapsedUs = nowUs - lastImuPollUs;
-    if (elapsedUs < 10000UL) return;
+    if (elapsedUs < 10000UL) return; // Poll at 100 Hz (every 10 ms)
 
     float dt = (float)elapsedUs * 1e-6f;
     lastImuPollUs = nowUs;
@@ -643,7 +655,8 @@ void startSDLogging() {
         csvFile.println(F(
             "TEAM_ID,TIME_STAMPING,PACKET_COUNT,ALTITUDE,PRESSURE,TEMP,VOLTAGE,"
             "GNSS_TIME,GNSS_LATITUDE,GNSS_LONGITUDE,GNSS_ALTITUDE,GNSS_SATS,"
-            "ACCELEROMETER_DATA,GYRO_SPIN_RATE,FLIGHT_SOFTWARE_STATE,OPTIONAL_DATA"
+            "ACCELEROMETER_DATA,GYRO_SPIN_RATE,FLIGHT_SOFTWARE_STATE,"
+            "NAV_E,NAV_N,COURSE,DES_COURSE,STEER,WIND_E,WIND_N,AIRSPEED,SINK,ARRIVAL_ALT,DIST,CANOPY_ALT"
         ));
         csvFile.flush();
         Serial.print(F("[SD] Logging STARTED -> "));
@@ -712,147 +725,111 @@ void logDataToSD(
     csvFile.print(flywheelRPM, 1);
     csvFile.print(',');
     csvFile.print(currentState);
-    csvFile.println(',');
+    // Guidance diagnostics for post-flight tuning
+    const float gncLog[12] = {
+        gnc.nav.x, gnc.nav.y, gnc.nav.courseDeg(), gnc.guidance.desiredCourse, gnc.steering,
+        gnc.air.windE, gnc.air.windN, gnc.air.airspeed, gnc.air.sinkStraight,
+        gnc.guidance.predictedArrivalAlt, gnc.guidance.distToTarget, flightSM.getCanopyOpenAlt()
+    };
+    for (uint8_t i = 0; i < 12; i++) {
+        csvFile.print(',');
+        csvFile.print(gncLog[i], 2);
+    }
+    csvFile.println();
     csvFile.flush();
 }
 #endif
 
-// ============================================================================
-// FlatSat Console Menu & ACTIVE/INACTIVE Status Matrix
-// ============================================================================
 __attribute__((noinline))
 static void printLblFloat(const __FlashStringHelper* lbl, float v, uint8_t dec) {
     Serial.print(lbl);
     Serial.print(v, dec);
 }
 
-__attribute__((noinline))
-static void printCommaFloat(float v, uint8_t dec) {
-    LORA_SERIAL.print(',');
-    LORA_SERIAL.print(v, dec);
+void printSensorStatus() {
+    float batV = readBatteryVoltage();
 #if defined(__AVR_ATmega2560__)
-    Serial1.print(',');
-    Serial1.print(v, dec);
-#endif
-}
-
-__attribute__((noinline))
-void printFlatSatMenu() {
-#if defined(__AVR_ATmega2560__)
-    Serial.println(F(
-        "\n=== FLATSAT MEGA 2560 ===\n"
-        "[1..8] States | [s] Status | [m] Hold/Auto | [t] LoRa TX\n"
-        "[l/n/r/g] Steer | [u/x/d] Servos | [b] Calib | [z] Tare"
-    ));
+    Serial.println(F("\n=== CAN-7USAT MEGA 2560 FSW ==="));
 #else
-    Serial.println(F(
-        "\n=== FLATSAT UNO ===\n"
-        "[1..8] States | [s] Status | [m] Hold/Auto | [t] LoRa TX\n"
-        "[l/n/r/g] Steer | [u/x/d] Servos | [b] Calib | [z] Tare"
-    ));
+    Serial.println(F("\n=== CAN-7USAT UNO FSW ==="));
 #endif
-}
-
-__attribute__((noinline))
-void printCurrentStateSummary() {
-    FlightState st = flightSM.getState();
-    bool activeFlight = (st >= FlightState::ASCENT && st < FlightState::LANDING);
-
-    Serial.print(F("\n--- FLATSAT STATUS ["));
-    Serial.print(flightSM.getStateName());
-    Serial.print(manualStateHold ? F(" | HOLD] ---\nBaro: ") : F(" | AUTO] ---\nBaro: "));
-    if (!baroOK) Serial.println(F("OFFLINE"));
-    else {
-        printLblFloat(F("Alt="), lastBaroAlt, 1);
-        printLblFloat(F("m P="), lastPressurePa, 0);
-        printLblFloat(F("Pa T="), lastTempC, 1);
-        Serial.println('C');
-    }
-
-    Serial.print(F("GPS : "));
-    if (!gnssOK) Serial.println(F("OFFLINE"));
-    else if (gnssSats > 0 || (gnssTimeStr[0] != '0' || gnssTimeStr[1] != '0')) {
-        if (gnssSats > 0) {
-            Serial.print(F("FIX Sats=")); Serial.print(gnssSats);
-            printLblFloat(F(" Lat="), (float)gnssLat, 5);
-            printLblFloat(F(" Lon="), (float)gnssLon, 5);
-        } else {
-            Serial.print(F("ACQ Sats=0"));
-        }
-        Serial.print(F(" T=")); Serial.println(gnssTimeStr);
-    } else {
-        Serial.print(F("SEARCHING Sats=0 (Rx="));
-        Serial.print(gnssRxBytes);
-        Serial.println(F(" B)"));
-    }
-
+    Serial.print(F("Baro: "));
+    Serial.println(baroOK ? F("OK") : F("FAIL"));
     Serial.print(F("IMU : "));
-    if (!imuOK) Serial.println(F("OFFLINE"));
-    else {
-        Serial.print(activeFlight ? F("ACT") : F("STBY"));
-        printLblFloat(mpuUpsideDown ? F("(INV) Hdg=") : F("(UP) Hdg="), wrap_360(rawIntegratedYawDeg + activeHeadingOffsetDeg), 1);
-        printLblFloat(F(" Gz="), spin, 1);
-        Serial.println();
-    }
-
-    Serial.print(F("Burn: "));
-    Serial.println(actuators.isBurnwirePinHigh() ? F("ON") : F("OFF"));
-
-    Serial.print(F("Buzz: "));
-    Serial.println(flightSM.isBuzzerActive() ? F("BEACON") : F("OFF"));
-
-    Serial.print(F("Serv: "));
-    if (directServoPulseMode || flightSM.isSteeringEnabled()) {
-        printLblFloat(F("Steer="), currentSteering, 2);
-        Serial.print(F(" L=")); Serial.print(actuators.getLeftServoPulseUs());
-        Serial.print(F(" R=")); Serial.println(actuators.getRightServoPulseUs());
+    if (imuOK) {
+        Serial.print(F("OK (0x"));
+        Serial.print(mpuI2CAddr, HEX);
+        Serial.println(mpuUpsideDown ? F(" INV)") : F(" UP)"));
     } else {
-        Serial.println(F("OFF [0mA]"));
+        Serial.println(F("FAIL"));
     }
-
-    Serial.print(F("Flyw: "));
-    Serial.print(actuators.isFlywheelActive() ? F("6000RPM ") : F("0RPM "));
-    Serial.print(actuators.getFlywheelPulseUs());
-    Serial.println(F("us"));
-
+    Serial.print(F("GNSS: "));
+    Serial.println(gnssOK ? F("OK") : F("FAIL"));
 #if HAS_SD_LOGGER
     Serial.print(F("SD  : "));
-    if (!sdOK) {
-        Serial.println(F("OFFLINE"));
-    } else if (sdLoggingActive) {
-        Serial.print(F("LOGGING -> "));
-        Serial.print(csvFileName);
-        Serial.print(F(" ("));
-        Serial.print(sdRecordCount);
-        Serial.println(F(" rows)"));
-    } else {
-        Serial.print(F("READY (CS="));
+    if (sdOK) {
+        Serial.print(F("OK (CS="));
         Serial.print(sdActiveCsPin);
-        Serial.println(F(")"));
+        Serial.println(')');
+    } else {
+        Serial.println(F("FAIL"));
     }
 #endif
-
-    printLblFloat(F("Batt: "), readBatteryVoltage(), 2);
-    Serial.println(telemetryEnabled ? F("V | LoRa: ON") : F("V | LoRa: PAUSED"));
+    printLblFloat(F("VBat: "), batV, 2);
+    Serial.println('V');
 }
 
-__attribute__((noinline))
+void printCurrentStateSummary() {
+    float batV = readBatteryVoltage();
+    float hdg = gnc.nav.courseDeg();
+    Serial.print(F("[STATUS] "));
+    Serial.print(flightSM.getStateName());
+    Serial.print(manualStateHold ? F(" HOLD") : F(" AUTO"));
+    printLblFloat(F(" Alt="), lastBaroAlt, 1);
+    printLblFloat(F("m Crs="), hdg, 1);
+    printLblFloat(F(" Dist="), gnc.guidance.distToTarget, 1);
+    printLblFloat(F(" Gz="), spin, 1);
+    Serial.print(F(" Sats="));
+    Serial.print(gnssSats);
+    Serial.print(F(" T="));
+    Serial.print(gnssTimeStr);
+    printLblFloat(F(" VBat="), batV, 2);
+    Serial.print(actuators.isBurnwirePinHigh() ? F("V Burn=ON") : F("V Burn=OFF"));
+    printLblFloat(F(" Steer="), currentSteering, 2);
+    Serial.println();
+}
+
 void updateTargetFromGPS() {
-    if (!targetGPSConfigured) return;
-    GPSPoint ref = launchGPSFixed ? launchGPS : GPSPoint(gnssLat, gnssLon);
-    if (!launchGPSFixed && gnssLat == 0.0 && gnssLon == 0.0) return;
-    targetLocal = gps_to_local(targetGPS, ref);
-    waypointManager.init(LocalPoint(0.0f, 0.0f), targetLocal, NUM_WAYPOINTS, WAYPOINT_ACCEPTANCE_RAD);
-    loiterGuidance.setCenter(targetLocal);
+    if (!targetGPSConfigured || !launchGPSFixed) return;
+    targetLocal = e7_to_local(targetLatE7, targetLonE7, launchLatE7, launchLonE7, launchCosLat);
+    gnc.setTarget(targetLocal.x, targetLocal.y);
+}
+
+// Parse "26.1234567" into 1e-7 degree integer units without float rounding.
+static int32_t parseDegE7(const char* s) {
+    while (*s == ' ') s++;
+    bool neg = false;
+    if (*s == '-') { neg = true; s++; }
+    else if (*s == '+') { s++; }
+    int32_t whole = 0;
+    while (*s >= '0' && *s <= '9') { whole = whole * 10 + (*s - '0'); s++; }
+    int32_t frac = 0;
+    uint8_t digits = 0;
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9') {
+            if (digits < 7) { frac = frac * 10 + (*s - '0'); digits++; }
+            s++;
+        }
+    }
+    while (digits < 7) { frac *= 10; digits++; }
+    int32_t v = whole * 10000000L + frac;
+    return neg ? -v : v;
 }
 
 __attribute__((noinline))
 static void syncActuatorsToState(uint32_t now) {
-    if (directServoPulseMode) {
-        actuators.setDirectPulse(directServoPulseUs, directServoPulseUs);
-    } else {
-        actuators.applySteering(currentSteering, flightSM.isSteeringEnabled(), now, flightSM.getState());
-    }
+    actuators.applySteering(currentSteering, flightSM.isSteeringEnabled(), now, flightSM.getState());
     actuators.setFlywheel(flightSM.isFlywheelActive());
     actuators.setBurnwire(flightSM.isBurnwireActive());
     actuators.updateBuzzer(flightSM.isBuzzerActive(), now);
@@ -861,14 +838,12 @@ static void syncActuatorsToState(uint32_t now) {
 
 void setFlightState(FlightState newState) {
     uint32_t now = millis();
-    directServoPulseMode = false;
-    manualStateHold = true; // Always hold the manually chosen state on FlatSat
+    manualStateHold = true; // Hold manually commanded state
     flightSM.forceState(newState, now);
 
     if (newState >= FlightState::ASCENT) {
         telemetryEnabled = true;
         telemAscentTriggered = true;
-        lastTelemetryMs = now - 1000UL;
 #if HAS_SD_LOGGER
         if (newState < FlightState::LANDING) {
             startSDLogging();
@@ -905,31 +880,71 @@ static bool cmdStartsP(const char* a, PGM_P prefix, size_t n) {
 }
 
 __attribute__((noinline))
-static void sendControlAck(const __FlashStringHelper* msg) {
-    LORA_SERIAL.println(msg);
-#if defined(__AVR_ATmega2560__)
-    Serial1.println(msg);
-#endif
-}
-
-__attribute__((noinline))
 static void applyManualSteerCmd(float val, const __FlashStringHelper* msg) {
-    directServoPulseMode = false;
     manualSteeringOverride = true;
     overrideSteeringVal = val;
     currentSteering = val;
     actuators.applySteering(currentSteering, flightSM.isSteeringEnabled(), millis(), flightSM.getState());
-    sendControlAck(msg);
+    LORA_SERIAL.println(msg);
     printCurrentStateSummary();
 }
 
-__attribute__((noinline))
-static void applyDirectServoCmd(int pulseUs, const __FlashStringHelper* msg) {
-    directServoPulseMode = true;
-    directServoPulseUs = pulseUs;
-    actuators.setDirectPulse(pulseUs, pulseUs);
-    Serial.println(msg);
-}
+struct CmdMapEntry {
+    const char* word;
+    char code;
+};
+
+static const char kW_PAD[]     PROGMEM = "LAUNCH";
+static const char kW_PAD2[]    PROGMEM = "PAD";
+static const char kW_ASC[]     PROGMEM = "ASCENT";
+static const char kW_DRG[]     PROGMEM = "DROGUE";
+static const char kW_DEP1[]    PROGMEM = "PARAFOIL";
+static const char kW_DEP2[]    PROGMEM = "DEPLOY";
+static const char kW_DEP3[]    PROGMEM = "BURN";
+static const char kW_DEP4[]    PROGMEM = "DROP";
+static const char kW_PRC[]     PROGMEM = "PRECISION";
+static const char kW_TRM[]     PROGMEM = "TERMINAL";
+static const char kW_FIN[]     PROGMEM = "FINAL";
+static const char kW_LND[]     PROGMEM = "LAND";
+static const char kW_AUT[]     PROGMEM = "AUTO";
+static const char kW_LFT[]     PROGMEM = "LEFT";
+static const char kW_NEU[]     PROGMEM = "NEUTRAL";
+static const char kW_RGT[]     PROGMEM = "RIGHT";
+static const char kW_GNC[]     PROGMEM = "GNC";
+static const char kW_STS[]     PROGMEM = "STATUS";
+static const char kW_TGO[]     PROGMEM = "START";
+static const char kW_TGO2[]    PROGMEM = "TELEM_START";
+static const char kW_TGO3[]    PROGMEM = "TELEM:START";
+static const char kW_TSP[]     PROGMEM = "STOP";
+static const char kW_TSP2[]    PROGMEM = "TELEM_STOP";
+static const char kW_TSP3[]    PROGMEM = "TELEM:STOP";
+static const char kW_CLR1[]    PROGMEM = "CALIB:CLEAR";
+static const char kW_CLR2[]    PROGMEM = "CALIB:RESET";
+static const char kW_CAL[]     PROGMEM = "CAL";
+static const char kW_TAR[]     PROGMEM = "TARE";
+static const char kW_ZER[]     PROGMEM = "ZERO";
+
+static const CmdMapEntry kCmdTable[] PROGMEM = {
+    { kW_PAD,  '1' }, { kW_PAD2, '1' },
+    { kW_ASC,  '2' },
+    { kW_DRG,  '3' },
+    { kW_DEP1, '4' }, { kW_DEP2, '4' }, { kW_DEP3, '4' }, { kW_DEP4, '4' },
+    { kW_PRC,  '5' },
+    { kW_TRM,  '6' },
+    { kW_FIN,  '7' },
+    { kW_LND,  '8' },
+    { kW_AUT,  'M' },
+    { kW_LFT,  'L' },
+    { kW_NEU,  'N' },
+    { kW_RGT,  'R' },
+    { kW_GNC,  'G' },
+    { kW_STS,  'S' },
+    { kW_TGO,  '+' }, { kW_TGO2, '+' }, { kW_TGO3, '+' },
+    { kW_TSP,  '-' }, { kW_TSP2, '-' }, { kW_TSP3, '-' },
+    { kW_CLR1, 'C' }, { kW_CLR2, 'C' },
+    { kW_CAL,  'B' },
+    { kW_TAR,  'Z' }, { kW_ZER,  'Z' }
+};
 
 __attribute__((noinline))
 void processTelecommand(char* rawCmd) {
@@ -947,7 +962,7 @@ void processTelecommand(char* rawCmd) {
 
     if (strstr_P(rawCmd, PSTR("VBAT")) != NULL || strstr_P(rawCmd, PSTR("BAT:RESET")) != NULL || strstr_P(rawCmd, PSTR("RESET:BAT")) != NULL) {
         resetBatteryVoltage(8200U);
-        sendControlAck(F("ACK:VBAT_RESET=8.20"));
+        LORA_SERIAL.println(F("ACK:VBAT_RESET=8.20"));
         return;
     }
 
@@ -958,7 +973,10 @@ void processTelecommand(char* rawCmd) {
 #if HAS_SD_LOGGER
         startSDLogging();
 #endif
-        sendControlAck(F("ACK:CX=ON"));
+        LORA_SERIAL.println(F("ACK:CX=ON"));
+#if defined(__AVR_ATmega2560__)
+        Serial1.println(F("ACK:CX=ON"));
+#endif
         return;
     }
     if (strstr_P(rawCmd, PSTR("STOP")) != NULL || strstr_P(rawCmd, PSTR("OFF")) != NULL || rawCmd[0] == '-') {
@@ -966,7 +984,10 @@ void processTelecommand(char* rawCmd) {
 #if HAS_SD_LOGGER
         stopSDLogging();
 #endif
-        sendControlAck(F("ACK:CX=OFF"));
+        LORA_SERIAL.println(F("ACK:CX=OFF"));
+#if defined(__AVR_ATmega2560__)
+        Serial1.println(F("ACK:CX=OFF"));
+#endif
         return;
     }
 
@@ -974,39 +995,27 @@ void processTelecommand(char* rawCmd) {
         rawCmd += 4;
         while (*rawCmd == ' ') rawCmd++;
     }
+
+    const char* tok = rawCmd;
     if (cmdStartsP(rawCmd, PSTR("STATE:"), 6)) {
-        rawCmd += 6;
-        while (*rawCmd == ' ') rawCmd++;
+        tok = rawCmd + 6;
+        while (*tok == ' ') tok++;
     }
 
-    char* comma = strchr(rawCmd, ',');
-    if (comma != NULL) {
-        char* coords = rawCmd;
-        if (cmdStartsP(rawCmd, PSTR("GPS:"), 4)) coords = rawCmd + 4;
-        else if (cmdStartsP(rawCmd, PSTR("TARGET:"), 7)) coords = rawCmd + 7;
-        while (*coords == ' ') coords++;
-        double inLat = (double)parseDecimalFloat(coords);
-        double inLon = (double)parseDecimalFloat(comma + 1);
-        if (isfinite(inLat) && isfinite(inLon) && (inLat != 0.0 || inLon != 0.0)) {
-            targetGPS = GPSPoint(inLat, inLon);
-            targetGPSConfigured = true;
-            updateTargetFromGPS();
-            LORA_SERIAL.print(F("ACK:TARGET_GPS="));
-            LORA_SERIAL.print(targetGPS.lat, 6);
-            LORA_SERIAL.print(',');
-            LORA_SERIAL.println(targetGPS.lon, 6);
-#if defined(__AVR_ATmega2560__)
-            Serial1.print(F("ACK:TARGET_GPS="));
-            Serial1.print(targetGPS.lat, 6);
-            Serial1.print(',');
-            Serial1.println(targetGPS.lon, 6);
-#endif
+    char code = 0;
+    if (tok[0] != '\0' && tok[1] == '\0') {
+        code = tok[0];
+        if (code >= 'a' && code <= 'z') code -= 32;
+        if (code == 'F') code = '4';
+    } else {
+        for (uint8_t i = 0; i < sizeof(kCmdTable) / sizeof(kCmdTable[0]); i++) {
+            PGM_P w = (PGM_P)pgm_read_word(&kCmdTable[i].word);
+            if (cmdStartsP(tok, w, strlen_P(w))) {
+                code = (char)pgm_read_byte(&kCmdTable[i].code);
+                break;
+            }
         }
-        return;
     }
-
-    char code = rawCmd[0];
-    if (code >= 'a' && code <= 'z') code -= 32;
 
     if (code >= '1' && code <= '8') {
         setFlightState((FlightState)(code - '0'));
@@ -1014,12 +1023,10 @@ void processTelecommand(char* rawCmd) {
     }
 
     switch (code) {
-        case '?':
-            printFlatSatMenu();
-            return;
         case 'M':
             manualStateHold = !manualStateHold;
-            sendControlAck(manualStateHold ? F("ACK:MODE=MANUAL_HOLD") : F("ACK:MODE=AUTO"));
+            LORA_SERIAL.print(F("ACK:MODE="));
+            LORA_SERIAL.println(manualStateHold ? F("MANUAL_HOLD") : F("AUTO"));
             printCurrentStateSummary();
             return;
         case 'L':
@@ -1032,49 +1039,71 @@ void processTelecommand(char* rawCmd) {
             applyManualSteerCmd(1.0f, F("ACK:STEER=RIGHT"));
             return;
         case 'G':
-            directServoPulseMode = false;
             manualSteeringOverride = false;
-            sendControlAck(F("ACK:STEER=GNC"));
+            LORA_SERIAL.println(F("ACK:STEER=GNC"));
             printCurrentStateSummary();
-            return;
-        case 'U':
-            applyDirectServoCmd(ES3004_MAX_PULSE_US, F("[SERVO] UNWIND (2400us)"));
-            return;
-        case 'X':
-            applyDirectServoCmd(ES3004_MIN_PULSE_US, F("[SERVO] BRAKE (500us)"));
-            return;
-        case 'D':
-            applyDirectServoCmd(0, F("[SERVO] DETACH (0mA)"));
             return;
         case 'S':
             printCurrentStateSummary();
             return;
+        case '+':
+            telemetryEnabled = true;
+            lastTelemetryMs = millis() - 900UL;
+            return;
+        case '-':
+            telemetryEnabled = false;
+            return;
         case 'T':
             telemetryEnabled = !telemetryEnabled;
-            sendControlAck(telemetryEnabled ? F("ACK:CX=ON") : F("ACK:CX=OFF"));
             return;
         case 'B':
-            sendControlAck(F("ACK:CALIB=STARTED"));
+            LORA_SERIAL.println(F("ACK:CALIB=STARTED"));
             calibrateMPU6050(true);
             return;
         case 'C':
             clearMPU6050EEPROM();
-            sendControlAck(F("ACK:CALIB=CLEARED"));
+            LORA_SERIAL.println(F("ACK:CALIB=CLEARED"));
             return;
         case 'Z':
             if (imuOK) {
                 pollMPU6050();
                 activeHeadingOffsetDeg = wrap_180(-rawIntegratedYawDeg);
-                LORA_SERIAL.print(F("ACK:TARE="));
+                LORA_SERIAL.print(F("ACK:TARE_HDG=0.0,OFFSET="));
                 LORA_SERIAL.println(activeHeadingOffsetDeg, 1);
-#if defined(__AVR_ATmega2560__)
-                Serial1.print(F("ACK:TARE="));
-                Serial1.println(activeHeadingOffsetDeg, 1);
-#endif
             }
             return;
         default:
             break;
+    }
+
+    // Precision Landing Target GPS Coordinates (GPS:<lat>,<lon> or TARGET:<lat>,<lon>)
+    const char* coords = rawCmd;
+    if (cmdStartsP(rawCmd, PSTR("GPS:"), 4)) {
+        coords = rawCmd + 4;
+    } else if (cmdStartsP(rawCmd, PSTR("TARGET:"), 7)) {
+        coords = rawCmd + 7;
+    }
+    while (*coords == ' ') coords++;
+
+    const char* comma = strchr(coords, ',');
+    if (comma != NULL) {
+        int32_t inLat = parseDegE7(coords);
+        int32_t inLon = parseDegE7(comma + 1);
+        if (labs(inLat) <= 900000000L && labs(inLon) <= 1800000000L && (inLat != 0 || inLon != 0)) {
+            targetLatE7 = inLat;
+            targetLonE7 = inLon;
+            targetGPSConfigured = true;
+            updateTargetFromGPS();
+
+            LORA_SERIAL.print(F("ACK:TARGET_GPS="));
+            LORA_SERIAL.print((float)targetLatE7 * 1e-7f, 6);
+            LORA_SERIAL.print(',');
+            LORA_SERIAL.print((float)targetLonE7 * 1e-7f, 6);
+            LORA_SERIAL.print(F(",LOCAL_E="));
+            LORA_SERIAL.print(targetLocal.x, 1);
+            LORA_SERIAL.print(F(",N="));
+            LORA_SERIAL.println(targetLocal.y, 1);
+        }
     }
 }
 
@@ -1106,6 +1135,16 @@ void pollTelecommands() {
             cmdBuf1[cmdLen1++] = c;
         }
     }
+#endif
+}
+
+__attribute__((noinline))
+static void printCommaFloat(float v, uint8_t dec) {
+    LORA_SERIAL.print(',');
+    LORA_SERIAL.print(v, dec);
+#if defined(__AVR_ATmega2560__)
+    Serial1.print(',');
+    Serial1.print(v, dec);
 #endif
 }
 
@@ -1184,9 +1223,12 @@ void transmitLoRaTelemetry(
 __attribute__((noinline))
 static bool initI2CBusSafe() {
     Wire.begin();
+    // CRITICAL SAFETY FOR 3.3V SENSORS ON ARDUINO UNO:
+    // Disable ATmega328P internal 5V pull-ups on SDA (A4) and SCL (A5) so bus stays at 3.3V!
     digitalWrite(SDA, LOW);
     digitalWrite(SCL, LOW);
     Wire.setClock(100000);
+    // Prevent AVR TWI infinite hang if no I2C sensors (no pull-ups) are connected:
     Wire.setWireTimeout(3000, true);
     delayMicroseconds(200);
 
@@ -1196,7 +1238,7 @@ static bool initI2CBusSafe() {
     digitalWrite(SDA, LOW);
     digitalWrite(SCL, LOW);
     if (Wire.getWireTimeoutFlag() || err == 5) {
-        TWCR = 0;
+        TWCR = 0; // Disable TWI when no pull-ups/sensors are connected so A4/A5 never hang
         return false;
     }
     return true;
@@ -1207,64 +1249,82 @@ static bool initI2CBusSafe() {
 // ============================================================================
 __attribute__((noinline))
 void setup() {
-    Serial.begin(LORA_BAUD);
+    Serial.begin(LORA_BAUD); // Pin 0 (RX0) & Pin 1 (TX0) @ 115200 baud
 #if defined(__AVR_ATmega2560__)
-    Serial1.begin(LORA_BAUD);
+    Serial1.begin(LORA_BAUD); // Pin 19 (RX1) & Pin 18 (TX1) @ 115200 baud
 #endif
     pinMode(VBAT_PIN, INPUT);
     delay(500);
 
+    // Initialize Actuators (2x ES3004 Servos on Pins 2 & 3, Burnwire Pin 4, Buzzer Pin 5, ESC Pin 6)
     actuators.init();
 
 #if HAS_SD_LOGGER
+    // Initialize MicroSD Card on SPI (Mega: MISO=50, MOSI=51, SCK=52, CS=53 or 10)
     if (initSDCard()) {
         startSDLogging();
     }
 #endif
 
+    // Start I2C safely (Uno: A4/A5, Mega: Pin 20 SDA / Pin 21 SCL) with 3 ms timeout
     if (initI2CBusSafe()) {
+        // 1. MS5611 Barometer (auto-detects 0x77 or 0x76)
         baroOK = initMS5611();
+
+        // 2. MPU6050 6-DOF IMU
         imuOK = initMPU6050();
         if (imuOK) {
             calibrateMPU6050(false);
         }
+
+        // 3. NEO-M9N GNSS (0x42)
         gnssOK = initGNSS();
     }
 
+    printSensorStatus();
+
+    // Calibrate Baseline Launch Pressure (50-sample average + 5-sample warm-up)
     if (baroOK) {
-        float sumP = 0.0f;
-        float lastT = 0.0f;
-        int valid = 0;
-        for (int i = 0; i < 20; i++) {
-            float p, t;
-            if (readMS5611(p, t)) {
-                sumP += p;
-                lastT = t;
-                valid++;
-            }
-            delay(15);
+        float dummyP, dummyT;
+        for (int i = 0; i < 5; i++) {
+            readMS5611(dummyP, dummyT);
+            delay(10);
         }
-        launchPressure = (valid > 0) ? (sumP / (float)valid) : SEA_LEVEL_HPA;
+
+        float sumPressure = 0.0f;
+        float lastCalTemp = 0.0f;
+        int validSamples = 0;
+        for (int i = 0; i < 50; i++) {
+            float currentP = 0.0f, currentT = 0.0f;
+            if (readMS5611(currentP, currentT)) {
+                if (isfinite(currentP) && currentP > 0.0f) {
+                    sumPressure += currentP;
+                    lastCalTemp = currentT;
+                    validSamples++;
+                }
+            }
+            delay(10);
+        }
+
+        if (validSamples > 0) {
+            launchPressure = sumPressure / (float)validSamples;
+        } else {
+            launchPressure = SEA_LEVEL_HPA;
+        }
         filteredPressure = launchPressure;
         lastPressurePa = launchPressure * 100.0f;
-        lastTempC = lastT;
+        lastTempC = lastCalTemp;
         groundAlt = 0.0f;
     }
 
-    LocalPoint startPt(0.0f, 0.0f);
-    waypointManager.init(startPt, targetLocal, NUM_WAYPOINTS, WAYPOINT_ACCEPTANCE_RAD);
-    loiterGuidance.setCenter(targetLocal);
+    gnc.setTarget(targetLocal.x, targetLocal.y);
+    gnc.reset(millis());
+    gnc.forceState(FlightState::LAUNCH_PAD, millis());
+    lastYawForRateDeg = rawIntegratedYawDeg;
     Serial.print(F("[NAV] Target GPS set: "));
-    Serial.print(targetGPS.lat, 6);
+    Serial.print((float)targetLatE7 * 1e-7f, 6);
     Serial.print(F(", "));
-    Serial.println(targetGPS.lon, 6);
-
-    ekf.reset(0.0f, 0.0f, 0.0f, 0.0f);
-    flightSM.reset();
-    flightSM.forceState(FlightState::LAUNCH_PAD, millis());
-
-    printFlatSatMenu();
-    printCurrentStateSummary();
+    Serial.println((float)targetLonE7 * 1e-7f, 6);
 
     missionStartMs = millis();
     lastControlUpdateMs = missionStartMs;
@@ -1278,18 +1338,22 @@ __attribute__((noinline))
 void loop() {
     uint32_t now = millis();
 
+    // Task 0: Poll Telecommands, 100 Hz MPU6050 Attitude & GNSS I2C Stream
     pollTelecommands();
     pollMPU6050();
-    bool newGnssFix = pollGNSS();
+    // Latch new PVT solutions until the next 10 Hz tick consumes them (the old
+    // code only used a fix if it completed in the same loop pass as the tick,
+    // so most GNSS updates were silently dropped).
+    static bool gnssFixPending = false;
+    if (pollGNSS()) gnssFixPending = true;
     actuators.update(now);
 
+    // Task 1: 10 Hz Control Loop
     if (now - lastControlUpdateMs >= (1000 / CONTROL_LOOP_HZ)) {
         float dt = (lastControlUpdateMs == 0) ? 0.1f : (float)(now - lastControlUpdateMs) / 1000.0f;
         lastControlUpdateMs = now;
 
-        FlightState prevState = flightSM.getState();
-        FlightState currentState = prevState;
-
+        // 1. Read MS5611 Barometer
         float alt_agl = lastBaroAlt;
         float rawPressure = 0.0f, rawTemp = 0.0f;
         if (baroOK && readMS5611(rawPressure, rawTemp)) {
@@ -1299,90 +1363,51 @@ void loop() {
                 filteredPressure = (EMA_ALPHA * rawPressure) + ((1.0f - EMA_ALPHA) * filteredPressure);
                 alt_agl = pressureToAlt(filteredPressure, launchPressure);
                 lastBaroAlt = alt_agl;
-
-                if (currentState > FlightState::LAUNCH_PAD && currentState < FlightState::LANDING) {
-                    ekf.correctBaro(alt_agl);
-                }
             }
         }
 
-        if (gnssSats >= 4 && !launchGPSFixed && (gnssLat != 0.0 || gnssLon != 0.0)) {
-            launchGPS = GPSPoint(gnssLat, gnssLon);
+        if (gnssFixType >= 3 && gnssSats >= GNSS_MIN_SATS && !launchGPSFixed) {
+            launchLatE7 = gnssLatE7;
+            launchLonE7 = gnssLonE7;
+            launchCosLat = cosf((float)launchLatE7 * 1e-7f * ((float)M_PI / 180.0f));
             launchGPSFixed = true;
             updateTargetFromGPS();
         }
 
-        if (currentState > FlightState::LAUNCH_PAD && currentState < FlightState::LANDING) {
-            float heading_deg = 0.0f;
-            if (imuOK) {
-                heading_deg = wrap_360(rawIntegratedYawDeg + activeHeadingOffsetDeg);
-                ekf.correctHeading(heading_deg);
-            }
-
-            if (newGnssFix && gnssSats >= 4) {
-                GPSPoint currentGPS(gnssLat, gnssLon);
-                LocalPoint posLocal = gps_to_local(currentGPS, launchGPS);
-                ekf.correctGPS(posLocal.x, posLocal.y, gnssVelEast, gnssVelNorth, true);
-
-                if (currentState <= FlightState::DROGUE_DESCENT) {
-                    windEstimator.update(gnssVelEast, gnssVelNorth);
-                } else {
-                    float psi_rad = deg2rad(heading_deg);
-                    float air_vx = FORWARD_AIRSPEED * sinf(psi_rad);
-                    float air_vy = FORWARD_AIRSPEED * cosf(psi_rad);
-                    windEstimator.update(gnssVelEast - air_vx, gnssVelNorth - air_vy);
-                }
-            }
-
-            ekf.setWindEstimate(windEstimator.getWindX(), windEstimator.getWindY());
-            ekf.predict(dt, currentSteering);
+        // 2. Sensor snapshot for the GNC core
+        GncSensors sens;
+        sens.now_ms = now;
+        sens.baro_valid = baroOK;
+        sens.baro_alt_agl = alt_agl;
+        sens.gyro_valid = imuOK;
+        float yawNow = rawIntegratedYawDeg;
+        sens.yaw_rate_dps = imuOK ? (wrap_180(yawNow - lastYawForRateDeg) / dt) : 0.0f;
+        lastYawForRateDeg = yawNow;
+        sens.gnss_new = gnssFixPending;
+        gnssFixPending = false;
+        sens.gnss_valid = launchGPSFixed && gnssFixType >= 3 && gnssSats >= GNSS_MIN_SATS;
+        sens.gnss_x = 0.0f;
+        sens.gnss_y = 0.0f;
+        if (sens.gnss_valid) {
+            LocalPoint p = e7_to_local(gnssLatE7, gnssLonE7, launchLatE7, launchLonE7, launchCosLat);
+            sens.gnss_x = p.x;
+            sens.gnss_y = p.y;
         }
+        sens.gnss_vn = gnssVelNorth;
+        sens.gnss_ve = gnssVelEast;
+        sens.gnss_vd = gnssVelDown;
 
-        LocalPoint navPos(ekf.getX(), ekf.getY());
-        float navHeading = ekf.getHeadingDeg();
-        float navAlt = ekf.getAltitude();
-
-        if (!manualStateHold) {
-            flightSM.update(alt_agl, navHeading, navPos, targetLocal, dt, now);
-        } else {
-            flightSM.tickTimers(now);
-        }
-        currentState = flightSM.getState();
-
-        ekf.setKinematics(
-            (currentState == FlightState::DROGUE_DESCENT) ? 0.0f : FORWARD_AIRSPEED,
-            (currentState == FlightState::DROGUE_DESCENT) ? DROGUE_DESCENT_RATE : PARAFOIL_DESCENT_RATE
-        );
-
-        if (manualSteeringOverride && flightSM.isSteeringEnabled()) {
-            currentSteering = overrideSteeringVal;
-        } else if (currentState == FlightState::PRECISION_GUIDANCE) {
-            guidanceController.setWind(windEstimator.getWindX(), windEstimator.getWindY());
-            GuidanceOutput gOut = guidanceController.update(navPos, navHeading, navAlt, dt);
-            currentSteering = gOut.steering;
-        } else if (currentState == FlightState::TERMINAL_GUIDANCE) {
-            loiterGuidance.setWind(windEstimator.getWindX(), windEstimator.getWindY());
-            currentSteering = loiterGuidance.update(navPos, navHeading);
-        } else if (currentState == FlightState::FINAL_APPROACH) {
-            float desired_course = bearing(navPos, targetLocal);
-            WindCompResult comp = calculate_wind_corrected_heading(
-                desired_course, FORWARD_AIRSPEED, windEstimator.getWindX(), windEstimator.getWindY()
-            );
-            float err_deg = heading_error(navHeading, comp.heading_deg);
-            currentSteering = pid.update(deg2rad(err_deg), dt);
-        } else {
-            currentSteering = 0.0f;
-            pid.reset();
-        }
+        // 3. One GNC step (navigation, air data, mission sequencing, guidance)
+        gnc.manualStateHold = manualStateHold;
+        gnc.manualSteering = manualSteeringOverride && flightSM.isSteeringEnabled();
+        gnc.manualSteeringValue = overrideSteeringVal;
+        GncOutputs gout = gnc.step(sens);
+        currentSteering = gout.steering;
 
         syncActuatorsToState(now);
-
-        if (currentState != prevState) {
-            printCurrentStateSummary();
-        }
     }
 
-    // Auto-enable LoRa telemetry once ASCENT begins
+    // Task 2: 1 Hz LoRa Telemetry Transmission (Auto-starts on ASCENT or via START command)
     if (flightSM.getState() >= FlightState::ASCENT && flightSM.getState() <= FlightState::LANDING) {
         if (!telemAscentTriggered) {
             telemAscentTriggered = true;

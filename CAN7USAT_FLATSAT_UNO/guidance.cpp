@@ -1,255 +1,306 @@
 #include "guidance.h"
 #include "nav_math.h"
-#include "config.h"
 
 // ============================================================================
-// Wind Estimator
+// HeadingController
 // ============================================================================
-WindEstimator::WindEstimator(float a) : alpha(a) {}
-
-void WindEstimator::reset() {
-    wind_x = 0.0f;
-    wind_y = 0.0f;
-    initialized = false;
-}
-
-void WindEstimator::update(float raw_wx, float raw_wy) {
-    if (!initialized) {
-        wind_x = raw_wx;
-        wind_y = raw_wy;
-        initialized = true;
-    } else {
-        wind_x = alpha * raw_wx + (1.0f - alpha) * wind_x;
-        wind_y = alpha * raw_wy + (1.0f - alpha) * wind_y;
-    }
-}
-
-// ============================================================================
-// PID Controller (Radian-Domain Input)
-// ============================================================================
-PIDController::PIDController(
-    float _kp, float _ki, float _kd,
-    float out_min, float out_max,
-    float int_min, float int_max
-) : kp(_kp), ki(_ki), kd(_kd),
-    output_min(out_min), output_max(out_max),
-    integral_min(int_min), integral_max(int_max) {}
-
-void PIDController::reset() {
-    integral = 0.0f;
-    previous_error = 0.0f;
-    initialized = false;
+void HeadingController::reset() {
+    integ = 0.0f;
+    last_err = 0.0f;
 }
 
 __attribute__((noinline))
-float PIDController::update(float error_rad, float dt) {
-    if (dt <= 0.0f) return 0.0f;
-
-    // Proportional
-    float p_term = kp * error_rad;
-
-    // Integral with anti-windup clamping
-    integral += error_rad * dt;
-    if (integral < integral_min) integral = integral_min;
-    if (integral > integral_max) integral = integral_max;
-    float i_term = ki * integral;
-
-    // Derivative
-    float d_term = 0.0f;
-    if (!initialized) {
-        initialized = true;
-    } else {
-        d_term = kd * ((error_rad - previous_error) / dt);
+float HeadingController::update(float desired_heading_deg, float heading_deg, float yaw_rate_dps,
+                                float rate_ff_dps, int8_t forced_dir, float dt) {
+    float err = wrap_180(desired_heading_deg - heading_deg);
+    if (forced_dir != 0 && fabsf(err) > 90.0f) {
+        err = (forced_dir > 0) ? fabsf(err) : -fabsf(err);
     }
-    previous_error = error_rad;
+    last_err = err;
 
-    float output = p_term + i_term + d_term;
-    if (output < output_min) output = output_min;
-    if (output > output_max) output = output_max;
-
-    return output;
+    float r_cmd = clampf(HDG_K * err + rate_ff_dps, -TURN_RATE_CMD_MAX, TURN_RATE_CMD_MAX);
+    float r_err = r_cmd - yaw_rate_dps;
+    integ = clampf(integ + RATE_KI * r_err * dt / TURN_AUTH_NOM, -RATE_I_LIMIT, RATE_I_LIMIT);
+    float u = (r_cmd + RATE_K * r_err) / TURN_AUTH_NOM + integ;
+    return clampf(u, -1.0f, 1.0f);
 }
 
 // ============================================================================
-// Waypoint Manager
+// PrecisionGuidance
 // ============================================================================
-WaypointManager::WaypointManager() : acceptance_radius(WAYPOINT_ACCEPTANCE_RAD) {}
+void PrecisionGuidance::reset() {
+    target = LocalPoint(TARGET_DEFAULT_EAST, TARGET_DEFAULT_NORTH);
+    mode_ = GuidanceMode::HOMING;
+    ctrl.reset();
+    forced_dir = 0;
+    crs_trim = 0.0f;
+    had_fit = false;
+    last_pass_ms = 0;
+    last_pass_alt = 0.0f;
+    have_pass = false;
+    leg_course = 0.0f;
+    leg_x0 = leg_y0 = 0.0f;
+    final_axis = 0.0f;
+    weave_sign = 1;
+    desiredCourse = 0.0f;
+    desiredHeading = 0.0f;
+    predictedArrivalAlt = 0.0f;
+    distToTarget = 0.0f;
+}
 
-void WaypointManager::init(const LocalPoint& start, const LocalPoint& target, int num_pts, float radius) {
-    total_pts = (num_pts > NUM_WAYPOINTS) ? NUM_WAYPOINTS : (uint8_t)num_pts;
-    if (total_pts < 1) total_pts = 1;
-    current_idx = 0;
-    acceptance_radius = radius;
-    target_pt = target;
+void PrecisionGuidance::setTarget(float x, float y) {
+    target = LocalPoint(x, y);
+}
 
-    for (int i = 1; i <= total_pts; i++) {
-        float fraction = (float)i / (float)total_pts;
-        waypoints[i - 1].x = start.x + fraction * (target.x - start.x);
-        waypoints[i - 1].y = start.y + fraction * (target.y - start.y);
+FlightState PrecisionGuidance::flightState() const {
+    switch (mode_) {
+        case GuidanceMode::HOMING:   return FlightState::PRECISION_GUIDANCE;
+        case GuidanceMode::FINAL:    return FlightState::FINAL_APPROACH;
+        default:                     return FlightState::TERMINAL_GUIDANCE;
     }
 }
 
-void WaypointManager::reset() {
-    current_idx = 0;
+float PrecisionGuidance::turnRatePlanDps() const {
+    // The rate loop holds TURN_RATE_CMD_MAX in long turns; 0.9 covers roll-in/out lag.
+    return 0.9f * TURN_RATE_CMD_MAX;
 }
 
-bool WaypointManager::update(const LocalPoint& current_pos) {
-    if (isComplete()) return false;
+void PrecisionGuidance::syncToFlightState(FlightState st, const GuidanceInputs& in) {
+    if (st == flightState()) return;
+    if (st == FlightState::PRECISION_GUIDANCE) {
+        mode_ = GuidanceMode::HOMING;
+    } else if (st == FlightState::TERMINAL_GUIDANCE) {
+        mode_ = GuidanceMode::LOITER;
+        have_pass = false;
+    } else if (st == FlightState::FINAL_APPROACH) {
+        enterFinal(in, 0);
+    }
+}
 
-    bool changed = false;
-    while (!isComplete()) {
-        LocalPoint wp = waypoints[current_idx];
-        float dist = distance_xy(current_pos, wp);
-        if (dist <= acceptance_radius) {
-            current_idx++;
-            changed = true;
-            continue;
+void PrecisionGuidance::enterFinal(const GuidanceInputs& in, int8_t turn_dir) {
+    mode_ = GuidanceMode::FINAL;
+    forced_dir = turn_dir;
+    final_axis = bearing(LocalPoint(in.x, in.y), target);
+    float a = deg2rad(final_axis);
+    float xt = (in.x - target.x) * cosf(a) - (in.y - target.y) * sinf(a);
+    weave_sign = (xt > 0.0f) ? -1 : 1;
+}
+
+void PrecisionGuidance::enterDownwind(const GuidanceInputs& in, float course) {
+    mode_ = GuidanceMode::DOWNWIND;
+    leg_course = course;
+    leg_x0 = in.x;
+    leg_y0 = in.y;
+    forced_dir = 0;
+}
+
+// Height left over at the target if we fly straight there from here.
+float PrecisionGuidance::straightArrivalAlt(const GuidanceInputs& in) const {
+    LocalPoint p(in.x, in.y);
+    float d = distance_xy(p, target);
+    float vg = ground_speed_on_course(bearing(p, target), in.airspeed, in.wind_e, in.wind_n);
+    return in.alt - in.sink_straight * d / vg;
+}
+
+// Height left over at the target if we start a turn in direction `dir` now
+// (at the planned turn rate), roll out pointing at the target, then fly straight.
+__attribute__((noinline))
+float PrecisionGuidance::predictTurnThenFinal(const GuidanceInputs& in, int8_t dir) const {
+    const float two_pi = 2.0f * (float)M_PI;
+    float va = in.airspeed;
+    float w = deg2rad(turnRatePlanDps());
+    float rt = va / w;
+    float psi0 = in.heading_valid ? deg2rad(in.heading_deg)
+                                  : atan2f(in.ve - in.wind_e, in.vn - in.wind_n);
+    float s = (float)dir;
+    float turn = (float)M_PI;
+    float ex = in.x, ey = in.y, tt = 0.0f;
+    for (uint8_t k = 0; k < 3; k++) {
+        float psi1 = psi0 + s * turn;
+        tt = turn / w;
+        ex = in.x + s * rt * (cosf(psi0) - cosf(psi1)) + in.wind_e * tt;
+        ey = in.y - s * rt * (sinf(psi0) - sinf(psi1)) + in.wind_n * tt;
+        if (k == 2) break;
+        float chi_f = bearing(LocalPoint(ex, ey), target);
+        float psi_f = deg2rad(calculate_wind_corrected_heading(chi_f, va, in.wind_e, in.wind_n).heading_deg);
+        float d = s * (psi_f - psi0);
+        while (d < 0.0f) d += two_pi;
+        while (d >= two_pi) d -= two_pi;
+        turn = d;
+    }
+    LocalPoint e(ex, ey);
+    float df = distance_xy(e, target);
+    float vg = ground_speed_on_course(bearing(e, target), va, in.wind_e, in.wind_n);
+    return in.alt - in.sink_turn * tt - in.sink_straight * df / vg;
+}
+
+__attribute__((noinline))
+float PrecisionGuidance::update(const GuidanceInputs& in_raw) {
+    // An un-fitted (drogue drift) wind can be badly off; never let it exceed
+    // the airspeed, or the wind triangle would point us the wrong way.
+    GuidanceInputs in = in_raw;
+    if (in.wind_fitted && !had_fit) {
+        crs_trim = 0.0f;     // the trim was compensating the rough drogue-drift wind
+        had_fit = true;
+    }
+    if (!in.wind_fitted) {
+        float w = sqrtf(in.wind_e * in.wind_e + in.wind_n * in.wind_n);
+        float wmax = SEED_WIND_MAX_FRAC * in.airspeed;
+        if (w > wmax) {
+            in.wind_e *= wmax / w;
+            in.wind_n *= wmax / w;
+        }
+    }
+    LocalPoint p(in.x, in.y);
+    distToTarget = distance_xy(p, target);
+    float gs = sqrtf(in.ve * in.ve + in.vn * in.vn);
+    float crs = wrap_360(rad2deg(atan2f(in.ve, in.vn)));
+    const int8_t dir = (LOITER_DIRECTION >= 0) ? 1 : -1;
+
+    if (!in.nav_valid) {
+        // GNSS lost: gentle constant turn keeps us near the area until it returns.
+        ctrl.reset();
+        return NAV_LOST_STEERING * (float)dir;
+    }
+
+    float wind = sqrtf(in.wind_e * in.wind_e + in.wind_n * in.wind_n);
+    bool calm = (!in.wind_known) || (wind < CALM_WIND_SPEED);
+    float downwind = calm ? crs : wrap_360(rad2deg(atan2f(in.wind_e, in.wind_n)));
+    // "Cannot fly upwind" is only believed from a fitted wind.
+    bool strong_wind = in.wind_fitted && (in.airspeed - wind) < 1.0f;
+
+    // ---------------- mode transitions ----------------
+    switch (mode_) {
+        case GuidanceMode::HOMING: {
+            predictedArrivalAlt = straightArrivalAlt(in);
+            if (distToTarget <= LOITER_RADIUS + LOITER_ENTRY_MARGIN) {
+                if (!strong_wind && in.alt > LOITER_FLOOR_ALT &&
+                    predictedArrivalAlt > ARRIVAL_ALT_BIAS + LOITER_MIN_EXCESS_ALT) {
+                    mode_ = GuidanceMode::LOITER;
+                    have_pass = false;
+                } else {
+                    enterFinal(in, 0);
+                }
+            } else if (predictedArrivalAlt <= ARRIVAL_ALT_BIAS + 3.0f) {
+                enterFinal(in, 0);
+            }
+            break;
+        }
+        case GuidanceMode::LOITER: {
+            if (in.alt < LOITER_FLOOR_ALT || strong_wind) {
+                enterFinal(in, dir);
+                break;
+            }
+            bool aligned = calm || fabsf(wrap_180(crs - downwind)) < DOWNWIND_ALIGN_DEG;
+            bool new_pass = calm || !have_pass || (uint32_t)(in.now_ms - last_pass_ms) > 10000UL;
+            if (aligned && new_pass) {
+                float va = in.airspeed;
+                float wr = wind / va;
+                float dh = in.sink_turn * (2.0f * (float)M_PI * LOITER_RADIUS / va) * (1.0f + 0.5f * wr * wr);
+                if (!calm) {
+                    if (have_pass && (last_pass_alt - in.alt) > 5.0f) dh = last_pass_alt - in.alt;
+                    last_pass_alt = in.alt;
+                    last_pass_ms = in.now_ms;
+                    have_pass = true;
+                }
+                predictedArrivalAlt = predictTurnThenFinal(in, dir);
+                if (predictedArrivalAlt - 1.1f * dh < ARRIVAL_ALT_BIAS) {
+                    enterDownwind(in, downwind);
+                }
+            }
+            break;
+        }
+        case GuidanceMode::DOWNWIND: {
+            predictedArrivalAlt = predictTurnThenFinal(in, dir);
+            if (predictedArrivalAlt <= ARRIVAL_ALT_BIAS || in.alt < 0.8f * LOITER_FLOOR_ALT) {
+                enterFinal(in, dir);
+            }
+            break;
+        }
+        case GuidanceMode::FINAL:
+        default:
+            // Entered FINAL with lots of height to spare (e.g. by telecommand or
+            // after a GNSS outage): go back to burning it off in the loiter.
+            if (!strong_wind && forced_dir == 0 &&
+                distToTarget <= LOITER_RADIUS + LOITER_ENTRY_MARGIN &&
+                in.alt > LOITER_FLOOR_ALT + 20.0f &&
+                straightArrivalAlt(in) > ARRIVAL_ALT_BIAS + LOITER_MIN_EXCESS_ALT + 20.0f) {
+                mode_ = GuidanceMode::LOITER;
+                have_pass = false;
+            }
+            break;
+    }
+
+    // ---------------- desired course for the active mode ----------------
+    float des = crs;
+    float rate_ff = 0.0f;
+    switch (mode_) {
+        case GuidanceMode::HOMING:
+            des = bearing(p, target);
+            break;
+
+        case GuidanceMode::LOITER: {
+            float d = distToTarget;
+            float th = (d > 1.0f) ? bearing(target, p) : wrap_360(crs - 90.0f * dir);
+            float delta = rad2deg(atanf((d - LOITER_RADIUS) / LOITER_LOOKAHEAD));
+            des = wrap_360(th + 90.0f * dir + dir * delta);
+            if (fabsf(d - LOITER_RADIUS) < 15.0f) rate_ff = dir * rad2deg(gs / LOITER_RADIUS);
+            break;
         }
 
-        // Standard passing plane check: advance if vehicle has progressed past
-        // the waypoint along the track vector toward the target
-        float v_x = target_pt.x - wp.x;
-        float v_y = target_pt.y - wp.y;
-        float p_x = current_pos.x - wp.x;
-        float p_y = current_pos.y - wp.y;
-        float dot = p_x * v_x + p_y * v_y;
-        if (dot > 0.0f) {
-            current_idx++;
-            changed = true;
-            continue;
+        case GuidanceMode::DOWNWIND: {
+            float a = deg2rad(leg_course);
+            float xt = (in.x - leg_x0) * cosf(a) - (in.y - leg_y0) * sinf(a);
+            des = wrap_360(leg_course - rad2deg(atanf(xt / LINE_LOOKAHEAD)));
+            break;
         }
-        break;
+
+        case GuidanceMode::FINAL:
+        default: {
+            des = bearing(p, target);
+            float vg = ground_speed_on_course(des, in.airspeed, in.wind_e, in.wind_n);
+            float h_need = in.sink_straight * distToTarget / vg;
+            predictedArrivalAlt = in.alt - h_need;
+            if (forced_dir != 0 && fabsf(wrap_180(des - crs)) < 90.0f) forced_dir = 0;
+            float h_avail = in.alt - 0.5f;
+            if (forced_dir == 0 && distToTarget > FINAL_WEAVE_MIN_DIST && vg > 1.5f && h_avail > h_need) {
+                // S-turns: fly at +/-phi off the target bearing so that the closing
+                // speed (~vg*cos(phi)) matches the height we have left.
+                float ratio = h_need / h_avail;
+                float cmin = cosf(deg2rad(FINAL_WEAVE_MAX_DEG));
+                if (ratio < cmin) ratio = cmin;
+                float phi = rad2deg(acosf(ratio));
+                if (phi > 3.0f) {
+                    float a = deg2rad(final_axis);
+                    float xt = (in.x - target.x) * cosf(a) - (in.y - target.y) * sinf(a);
+                    if (weave_sign > 0 && xt > FINAL_WEAVE_XTRACK) weave_sign = -1;
+                    else if (weave_sign < 0 && xt < -FINAL_WEAVE_XTRACK) weave_sign = 1;
+                    des = wrap_360(des + weave_sign * phi);
+                }
+            }
+            break;
+        }
     }
-    return changed;
-}
+    desiredCourse = des;
 
-void WaypointManager::skipToFinalTarget() {
-    current_idx = total_pts;
-}
-
-LocalPoint WaypointManager::getCurrentWaypoint() const {
-    if (isComplete()) return target_pt;
-    return waypoints[current_idx];
-}
-
-// ============================================================================
-// Guidance Controller
-// ============================================================================
-GuidanceController::GuidanceController(WaypointManager* wm, PIDController* p)
-    : waypoint_manager(wm), pid(p), wind_x(0.0f), wind_y(0.0f) {}
-
-void GuidanceController::reset() {
-    if (waypoint_manager) waypoint_manager->reset();
-    if (pid) pid->reset();
-}
-
-__attribute__((noinline))
-GuidanceOutput GuidanceController::update(const LocalPoint& position, float heading, float /*altitude*/, float dt) {
-    GuidanceOutput out = {};
-    if (!waypoint_manager || !pid) return out;
-
-    if (waypoint_manager->update(position)) {
-        pid->reset();
+    // Steer the air-relative heading: desired heading = wind-triangle crab for
+    // the desired ground course.  Falls back to the GNSS course if the heading
+    // estimate is not available yet.
+    float meas = crs;
+    float cmd = des;
+    if (in.heading_valid) {
+        meas = in.heading_deg;
+        cmd = calculate_wind_corrected_heading(des, in.airspeed, in.wind_e, in.wind_n).heading_deg;
+        // Slow outer loop on the real ground track: if the wind estimate is
+        // wrong the course drifts off; integrate that error into a heading trim.
+        // Frozen in the loiter (it has its own position feedback) and in big turns.
+        float ce = wrap_180(des - crs);
+        if (mode_ != GuidanceMode::LOITER && forced_dir == 0 && gs > CRS_TRIM_MIN_GS && fabsf(ce) < 90.0f) {
+            crs_trim = clampf(crs_trim + CRS_TRIM_KI * clampf(ce, -45.0f, 45.0f) * in.dt,
+                              -CRS_TRIM_MAX_DEG, CRS_TRIM_MAX_DEG);
+        }
+        cmd = wrap_360(cmd + crs_trim);
     }
-
-    LocalPoint active_wp = waypoint_manager->getCurrentWaypoint();
-    float desired_course = bearing(position, active_wp);
-    WindCompResult comp = calculate_wind_corrected_heading(desired_course, FORWARD_AIRSPEED, wind_x, wind_y);
-    float err_deg = heading_error(heading, comp.heading_deg);
-    out.steering = pid->update(deg2rad(err_deg), dt);
-    return out;
-}
-
-// ============================================================================
-// Loiter Guidance
-// ============================================================================
-LoiterGuidance::LoiterGuidance()
-    : center(TARGET_DEFAULT_EAST, TARGET_DEFAULT_NORTH),
-      radius(LOITER_RADIUS),
-      direction(LoiterDirection::CLOCKWISE),
-      capture_tolerance(LOITER_CAPTURE_TOL),
-      forward_speed(FORWARD_AIRSPEED),
-      max_turn_rate(MAX_TURN_RATE_DEG_S) {}
-
-__attribute__((noinline))
-float LoiterGuidance::update(const LocalPoint& position, float current_heading) {
-    radial_dist = distance_xy(center, position);
-    radial_err = radial_dist - radius;
-
-    float dir_sign = (direction == LoiterDirection::CLOCKWISE) ? 1.0f : -1.0f;
-    bool is_tracking = fabsf(radial_err) <= capture_tolerance;
-    phase = is_tracking ? LoiterPhase::ORBIT_TRACKING : LoiterPhase::ORBIT_CAPTURE;
-
-    float desired_course = 0.0f;
-    float feedforward = 0.0f;
-
-    if (is_tracking) {
-        float pure_tangent = calculate_tangent_heading(center, position, direction);
-        float corr_deg = rad2deg(atanf(radial_err / radius));
-        if (corr_deg > 30.0f) corr_deg = 30.0f;
-        if (corr_deg < -30.0f) corr_deg = -30.0f;
-
-        desired_course = wrap_360(pure_tangent + dir_sign * corr_deg);
-        float nominal_turn_rate = rad2deg(forward_speed / radius);
-        feedforward = dir_sign * (nominal_turn_rate / max_turn_rate);
-    } else if (radial_dist > radius + capture_tolerance) {
-        float theta_to_center = bearing(position, center);
-        float ratio = radius / radial_dist;
-        if (ratio > 1.0f) ratio = 1.0f;
-        float alpha_deg = rad2deg(ratio * (1.0f + 0.166667f * ratio * ratio));
-        desired_course = wrap_360(theta_to_center - dir_sign * alpha_deg);
-    } else if (radial_dist < 1e-4f) {
-        desired_course = current_heading;
-    } else {
-        float rad_b = bearing(center, position);
-        float ratio = radial_dist / radius;
-        if (ratio > 1.0f) ratio = 1.0f;
-        float gamma_deg = rad2deg(ratio * (1.0f + 0.166667f * ratio * ratio));
-        desired_course = wrap_360(rad_b + dir_sign * gamma_deg);
-    }
-
-    WindCompResult comp = calculate_wind_corrected_heading(desired_course, forward_speed, wind_x, wind_y);
-    desired_hdg = comp.heading_deg;
-
-    float err = heading_error(current_heading, desired_hdg);
-    float cmd = feedforward + (err / 45.0f);
-    if (cmd > 1.0f) cmd = 1.0f;
-    if (cmd < -1.0f) cmd = -1.0f;
-    return cmd;
-}
-
-// ============================================================================
-// Energy Check
-// ============================================================================
-__attribute__((noinline))
-bool shouldEnterTerminalGuidance(
-    float altitude,
-    float target_distance,
-    float /*wind_x*/,
-    float /*wind_y*/,
-    float /*desired_course_deg*/
-) {
-    if (altitude <= 0.0f || target_distance <= 0.0f || target_distance > TERMINAL_CAPTURE_RADIUS) return false;
-    float glide_range = (FORWARD_AIRSPEED / PARAFOIL_DESCENT_RATE) * altitude;
-    return (glide_range >= (target_distance + TERMINAL_MARGIN));
-}
-
-// ============================================================================
-// Breakout Geometry Solver
-// ============================================================================
-__attribute__((noinline))
-BreakoutGeometry calculateBreakoutGeometry(
-    const LocalPoint& position,
-    float heading,
-    const LocalPoint& target,
-    float /*wind_x*/,
-    float /*wind_y*/
-) {
-    BreakoutGeometry geom = {};
-    float dist = distance_xy(position, target);
-    float t_straight = dist / FORWARD_AIRSPEED;
-    float t_turn = fabsf(heading_error(heading, bearing(position, target))) / MAX_TURN_RATE_DEG_S;
-    geom.minimum_required_altitude = PARAFOIL_DESCENT_RATE * (t_straight + t_turn);
-    geom.breakout_altitude = geom.minimum_required_altitude + BREAKOUT_ALT_MARGIN;
-    return geom;
+    desiredHeading = cmd;
+    return ctrl.update(cmd, meas, in.yaw_rate_dps, rate_ff, forced_dir, in.dt);
 }

@@ -11,12 +11,14 @@
 #define HAS_SD_LOGGER 0
 #endif
 
+#if defined(__AVR_ATmega328P__)
+#error "CAN-7USAT FSW needs an Arduino Mega 2560: the Uno has too little flash for the GNC code and no SD logging (rule 5.1.xi requires onboard SD storage)."
+#endif
+
 #include "config.h"
 #include "nav_types.h"
 #include "nav_math.h"
-#include "ekf.h"
-#include "guidance.h"
-#include "flight_sm.h"
+#include "gnc.h"
 #include "actuators.h"
 
 // ============================================================================
@@ -60,16 +62,11 @@ uint32_t sdRecordCount = 0;
 uint32_t lastSdLogMs = 0;
 #endif
 
-// Navigation & Estimation
-ExtendedKalmanFilter ekf;
-WindEstimator windEstimator;
-PIDController pid(PID_KP, PID_KI, PID_KD, -1.0f, 1.0f, -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
-WaypointManager waypointManager;
-GuidanceController guidanceController(&waypointManager, &pid);
-LoiterGuidance loiterGuidance;
+// Guidance, Navigation & Control core (shared with the ../sil simulator)
+GncCore gnc;
+FlightStateMachine& flightSM = gnc.sm;
 
-// Flight Management & Actuators
-FlightStateMachine flightSM;
+// Actuators
 ActuatorManager actuators;
 
 // Barometer Calibration & Filtering State Variables
@@ -78,12 +75,14 @@ float filteredPressure = 1013.25f;
 const float EMA_ALPHA = BARO_EMA_ALPHA;
 float groundAlt = 0.0f;
 
-// Navigation & Timing State Variables
-GPSPoint launchGPS(0.0, 0.0);
+// Navigation & Timing State Variables (raw UBX integers, 1e-7 deg: exact on AVR)
+int32_t launchLatE7 = 0, launchLonE7 = 0;
+float launchCosLat = 1.0f;
 bool launchGPSFixed = false;
-GPSPoint targetGPS(DEFAULT_TARGET_LAT, DEFAULT_TARGET_LON);
+int32_t targetLatE7 = DEFAULT_TARGET_LAT_E7, targetLonE7 = DEFAULT_TARGET_LON_E7;
 bool targetGPSConfigured = true;
 LocalPoint targetLocal(TARGET_DEFAULT_EAST, TARGET_DEFAULT_NORTH);
+float lastYawForRateDeg = 0.0f;
 
 // LoRa Telecommand & Telemetry Gating State
 bool telemetryEnabled = false; // Auto-starts on ASCENT or via Ground Station "START" command
@@ -111,39 +110,17 @@ float activeHeadingOffsetDeg = IMU_HEADING_OFFSET_DEG;
 
 char gnssTimeStr[12] = "00:00:00";
 double gnssLat = 0.0, gnssLon = 0.0;
+int32_t gnssLatE7 = 0, gnssLonE7 = 0;
 float gnssAltMSL = 0.0f;
-float gnssVelEast = 0.0f, gnssVelNorth = 0.0f;
+float gnssVelEast = 0.0f, gnssVelNorth = 0.0f, gnssVelDown = 0.0f;
 int gnssSats = 0;
+uint8_t gnssFixType = 0;
 
 // ============================================================================
 // Lightweight Direct u-blox NEO-M9N I2C (0x42) Driver (Zero Library Overhead)
 // Reads standard NMEA ($GNGGA / $GPGGA and $GNRMC / $GPRMC) over u-blox DDC
 // ============================================================================
 #define UBLOX_I2C_ADDR 0x42
-
-static float parseDecimalFloat(const char* s) {
-    if (!s) return 0.0f;
-    while (*s == ' ') s++;
-    float sign = 1.0f;
-    if (*s == '-') { sign = -1.0f; s++; }
-    else if (*s == '+') { s++; }
-
-    float val = 0.0f;
-    while (*s >= '0' && *s <= '9') {
-        val = val * 10.0f + (float)(*s - '0');
-        s++;
-    }
-    if (*s == '.') {
-        s++;
-        float scale = 0.1f;
-        while (*s >= '0' && *s <= '9') {
-            val += (float)(*s - '0') * scale;
-            scale *= 0.1f;
-            s++;
-        }
-    }
-    return val * sign;
-}
 
 // ============================================================================
 // UBX Binary (UBX-NAV-PVT) & NMEA Stream Decoders
@@ -154,7 +131,7 @@ static uint8_t ubxClass = 0, ubxId = 0;
 static uint16_t ubxLen = 0, ubxPos = 0;
 static uint8_t ubxCkA = 0, ubxCkB = 0;
 static uint8_t pvtHour = 0, pvtMin = 0, pvtSec = 0, pvtFix = 0, pvtSats = 0;
-static int32_t pvtLat = 0, pvtLon = 0, pvtHmsl = 0, pvtVelN = 0, pvtVelE = 0;
+static int32_t pvtLat = 0, pvtLon = 0, pvtHmsl = 0, pvtVelN = 0, pvtVelE = 0, pvtVelD = 0;
 
 static void format2Digits(char* dst, uint8_t v) {
     dst[0] = '0' + (v / 10);
@@ -199,6 +176,7 @@ static bool parseUbxByte(uint8_t b) {
             else if (ubxPos >= 36 && ubxPos <= 39) p = (uint8_t*)&pvtHmsl + (ubxPos - 36);
             else if (ubxPos >= 48 && ubxPos <= 51) p = (uint8_t*)&pvtVelN + (ubxPos - 48);
             else if (ubxPos >= 52 && ubxPos <= 55) p = (uint8_t*)&pvtVelE + (ubxPos - 52);
+            else if (ubxPos >= 56 && ubxPos <= 59) p = (uint8_t*)&pvtVelD + (ubxPos - 56);
             if (p) *p = b;
         }
         if (++ubxPos >= ubxLen) ubxStep = 7;
@@ -208,6 +186,7 @@ static bool parseUbxByte(uint8_t b) {
     } else if (ubxStep == 8) {
         if (b == ubxCkB && ubxClass == 0x01 && ubxId == 0x07) {
             gnssSats = pvtSats;
+            gnssFixType = pvtFix;
             format2Digits(gnssTimeStr, pvtHour);
             gnssTimeStr[2] = ':';
             format2Digits(gnssTimeStr + 3, pvtMin);
@@ -215,17 +194,47 @@ static bool parseUbxByte(uint8_t b) {
             format2Digits(gnssTimeStr + 6, pvtSec);
             gnssTimeStr[8] = '\0';
             if (pvtFix >= 2) {
+                gnssLatE7 = pvtLat;
+                gnssLonE7 = pvtLon;
                 gnssLat = (double)pvtLat * 1e-7;
                 gnssLon = (double)pvtLon * 1e-7;
                 gnssAltMSL = (float)pvtHmsl * 0.001f;
                 gnssVelNorth = (float)pvtVelN * 0.001f;
                 gnssVelEast = (float)pvtVelE * 0.001f;
+                gnssVelDown = (float)pvtVelD * 0.001f;
             }
             gotPvt = true;
         }
         ubxStep = (b == 0xB5) ? 1 : 0;
     }
     return gotPvt;
+}
+
+// UBX-CFG-VALSET (RAM layer) with a run-time Fletcher checksum.
+// Keys (u-blox M9 interface description):
+//   CFG-RATE-MEAS        0x30210001 U2  = GNSS_MEAS_RATE_MS (5 Hz)
+//   CFG-I2COUTPROT-NMEA  0x10720002 L   = 0  (UBX only: NMEA was wasting I2C bandwidth)
+//   CFG-NAVSPG-DYNMODEL  0x20110021 E1  = 6  (airborne <1 g)
+static void sendUbxValsetGnc() {
+    uint8_t m[8 + 4 + 6 + 5 + 5];
+    uint8_t n = 0;
+    m[n++] = 0xB5; m[n++] = 0x62; m[n++] = 0x06; m[n++] = 0x8A;
+    m[n++] = 0; m[n++] = 0;                         // length, patched below
+    m[n++] = 0x00; m[n++] = 0x01; m[n++] = 0x00; m[n++] = 0x00;   // version, RAM layer, reserved
+    m[n++] = 0x01; m[n++] = 0x00; m[n++] = 0x21; m[n++] = 0x30;   // CFG-RATE-MEAS
+    m[n++] = (uint8_t)(GNSS_MEAS_RATE_MS & 0xFF); m[n++] = (uint8_t)(GNSS_MEAS_RATE_MS >> 8);
+    m[n++] = 0x02; m[n++] = 0x00; m[n++] = 0x72; m[n++] = 0x10; m[n++] = 0x00;   // CFG-I2COUTPROT-NMEA = 0
+    m[n++] = 0x21; m[n++] = 0x00; m[n++] = 0x11; m[n++] = 0x20; m[n++] = 0x06;   // CFG-NAVSPG-DYNMODEL = 6
+    uint16_t len = n - 6;
+    m[4] = (uint8_t)(len & 0xFF);
+    m[5] = (uint8_t)(len >> 8);
+    uint8_t ckA = 0, ckB = 0;
+    for (uint8_t i = 2; i < n; i++) { ckA += m[i]; ckB += ckA; }
+    m[n++] = ckA;
+    m[n++] = ckB;
+    Wire.beginTransmission(UBLOX_I2C_ADDR);
+    Wire.write(m, n);
+    Wire.endTransmission();
 }
 
 static bool initGNSS() {
@@ -248,6 +257,10 @@ static bool initGNSS() {
         0x1C, 0xF0
     };
     sendUbxCmd(ubxCfgNavPvt, sizeof(ubxCfgNavPvt));
+
+    // 5 Hz navigation, UBX-only on I2C, airborne dynamic model
+    delay(20);
+    sendUbxValsetGnc();
 
     return true;
 }
@@ -642,7 +655,8 @@ void startSDLogging() {
         csvFile.println(F(
             "TEAM_ID,TIME_STAMPING,PACKET_COUNT,ALTITUDE,PRESSURE,TEMP,VOLTAGE,"
             "GNSS_TIME,GNSS_LATITUDE,GNSS_LONGITUDE,GNSS_ALTITUDE,GNSS_SATS,"
-            "ACCELEROMETER_DATA,GYRO_SPIN_RATE,FLIGHT_SOFTWARE_STATE,OPTIONAL_DATA"
+            "ACCELEROMETER_DATA,GYRO_SPIN_RATE,FLIGHT_SOFTWARE_STATE,"
+            "NAV_E,NAV_N,COURSE,DES_COURSE,STEER,WIND_E,WIND_N,AIRSPEED,SINK,ARRIVAL_ALT,DIST,CANOPY_ALT"
         ));
         csvFile.flush();
         Serial.print(F("[SD] Logging STARTED -> "));
@@ -711,7 +725,17 @@ void logDataToSD(
     csvFile.print(flywheelRPM, 1);
     csvFile.print(',');
     csvFile.print(currentState);
-    csvFile.println(',');
+    // Guidance diagnostics for post-flight tuning
+    const float gncLog[12] = {
+        gnc.nav.x, gnc.nav.y, gnc.nav.courseDeg(), gnc.guidance.desiredCourse, gnc.steering,
+        gnc.air.windE, gnc.air.windN, gnc.air.airspeed, gnc.air.sinkStraight,
+        gnc.guidance.predictedArrivalAlt, gnc.guidance.distToTarget, flightSM.getCanopyOpenAlt()
+    };
+    for (uint8_t i = 0; i < 12; i++) {
+        csvFile.print(',');
+        csvFile.print(gncLog[i], 2);
+    }
+    csvFile.println();
     csvFile.flush();
 }
 #endif
@@ -757,12 +781,13 @@ void printSensorStatus() {
 
 void printCurrentStateSummary() {
     float batV = readBatteryVoltage();
-    float hdg = wrap_360(rawIntegratedYawDeg + activeHeadingOffsetDeg);
+    float hdg = gnc.nav.courseDeg();
     Serial.print(F("[STATUS] "));
     Serial.print(flightSM.getStateName());
     Serial.print(manualStateHold ? F(" HOLD") : F(" AUTO"));
     printLblFloat(F(" Alt="), lastBaroAlt, 1);
-    printLblFloat(F("m Hdg="), hdg, 1);
+    printLblFloat(F("m Crs="), hdg, 1);
+    printLblFloat(F(" Dist="), gnc.guidance.distToTarget, 1);
     printLblFloat(F(" Gz="), spin, 1);
     Serial.print(F(" Sats="));
     Serial.print(gnssSats);
@@ -775,13 +800,31 @@ void printCurrentStateSummary() {
 }
 
 void updateTargetFromGPS() {
-    if (!targetGPSConfigured) return;
-    if (launchGPSFixed || (gnssLat != 0.0 || gnssLon != 0.0)) {
-        GPSPoint origin = launchGPSFixed ? launchGPS : GPSPoint(gnssLat, gnssLon);
-        targetLocal = gps_to_local(targetGPS, origin);
-        waypointManager.init(LocalPoint(0.0f, 0.0f), targetLocal, NUM_WAYPOINTS, WAYPOINT_ACCEPTANCE_RAD);
-        loiterGuidance.setCenter(targetLocal);
+    if (!targetGPSConfigured || !launchGPSFixed) return;
+    targetLocal = e7_to_local(targetLatE7, targetLonE7, launchLatE7, launchLonE7, launchCosLat);
+    gnc.setTarget(targetLocal.x, targetLocal.y);
+}
+
+// Parse "26.1234567" into 1e-7 degree integer units without float rounding.
+static int32_t parseDegE7(const char* s) {
+    while (*s == ' ') s++;
+    bool neg = false;
+    if (*s == '-') { neg = true; s++; }
+    else if (*s == '+') { s++; }
+    int32_t whole = 0;
+    while (*s >= '0' && *s <= '9') { whole = whole * 10 + (*s - '0'); s++; }
+    int32_t frac = 0;
+    uint8_t digits = 0;
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9') {
+            if (digits < 7) { frac = frac * 10 + (*s - '0'); digits++; }
+            s++;
+        }
     }
+    while (digits < 7) { frac *= 10; digits++; }
+    int32_t v = whole * 10000000L + frac;
+    return neg ? -v : v;
 }
 
 __attribute__((noinline))
@@ -837,20 +880,12 @@ static bool cmdStartsP(const char* a, PGM_P prefix, size_t n) {
 }
 
 __attribute__((noinline))
-static void sendControlAck(const __FlashStringHelper* msg) {
-    LORA_SERIAL.println(msg);
-#if defined(__AVR_ATmega2560__)
-    Serial1.println(msg);
-#endif
-}
-
-__attribute__((noinline))
 static void applyManualSteerCmd(float val, const __FlashStringHelper* msg) {
     manualSteeringOverride = true;
     overrideSteeringVal = val;
     currentSteering = val;
     actuators.applySteering(currentSteering, flightSM.isSteeringEnabled(), millis(), flightSM.getState());
-    sendControlAck(msg);
+    LORA_SERIAL.println(msg);
     printCurrentStateSummary();
 }
 
@@ -927,7 +962,7 @@ void processTelecommand(char* rawCmd) {
 
     if (strstr_P(rawCmd, PSTR("VBAT")) != NULL || strstr_P(rawCmd, PSTR("BAT:RESET")) != NULL || strstr_P(rawCmd, PSTR("RESET:BAT")) != NULL) {
         resetBatteryVoltage(8200U);
-        sendControlAck(F("ACK:VBAT_RESET=8.20"));
+        LORA_SERIAL.println(F("ACK:VBAT_RESET=8.20"));
         return;
     }
 
@@ -938,7 +973,10 @@ void processTelecommand(char* rawCmd) {
 #if HAS_SD_LOGGER
         startSDLogging();
 #endif
-        sendControlAck(F("ACK:CX=ON"));
+        LORA_SERIAL.println(F("ACK:CX=ON"));
+#if defined(__AVR_ATmega2560__)
+        Serial1.println(F("ACK:CX=ON"));
+#endif
         return;
     }
     if (strstr_P(rawCmd, PSTR("STOP")) != NULL || strstr_P(rawCmd, PSTR("OFF")) != NULL || rawCmd[0] == '-') {
@@ -946,7 +984,10 @@ void processTelecommand(char* rawCmd) {
 #if HAS_SD_LOGGER
         stopSDLogging();
 #endif
-        sendControlAck(F("ACK:CX=OFF"));
+        LORA_SERIAL.println(F("ACK:CX=OFF"));
+#if defined(__AVR_ATmega2560__)
+        Serial1.println(F("ACK:CX=OFF"));
+#endif
         return;
     }
 
@@ -984,7 +1025,8 @@ void processTelecommand(char* rawCmd) {
     switch (code) {
         case 'M':
             manualStateHold = !manualStateHold;
-            sendControlAck(manualStateHold ? F("ACK:MODE=MANUAL_HOLD") : F("ACK:MODE=AUTO"));
+            LORA_SERIAL.print(F("ACK:MODE="));
+            LORA_SERIAL.println(manualStateHold ? F("MANUAL_HOLD") : F("AUTO"));
             printCurrentStateSummary();
             return;
         case 'L':
@@ -998,7 +1040,7 @@ void processTelecommand(char* rawCmd) {
             return;
         case 'G':
             manualSteeringOverride = false;
-            sendControlAck(F("ACK:STEER=GNC"));
+            LORA_SERIAL.println(F("ACK:STEER=GNC"));
             printCurrentStateSummary();
             return;
         case 'S':
@@ -1007,23 +1049,20 @@ void processTelecommand(char* rawCmd) {
         case '+':
             telemetryEnabled = true;
             lastTelemetryMs = millis() - 900UL;
-            sendControlAck(F("ACK:CX=ON"));
             return;
         case '-':
             telemetryEnabled = false;
-            sendControlAck(F("ACK:CX=OFF"));
             return;
         case 'T':
             telemetryEnabled = !telemetryEnabled;
-            sendControlAck(telemetryEnabled ? F("ACK:CX=ON") : F("ACK:CX=OFF"));
             return;
         case 'B':
-            sendControlAck(F("ACK:CALIB=STARTED"));
+            LORA_SERIAL.println(F("ACK:CALIB=STARTED"));
             calibrateMPU6050(true);
             return;
         case 'C':
             clearMPU6050EEPROM();
-            sendControlAck(F("ACK:CALIB=CLEARED"));
+            LORA_SERIAL.println(F("ACK:CALIB=CLEARED"));
             return;
         case 'Z':
             if (imuOK) {
@@ -1031,10 +1070,6 @@ void processTelecommand(char* rawCmd) {
                 activeHeadingOffsetDeg = wrap_180(-rawIntegratedYawDeg);
                 LORA_SERIAL.print(F("ACK:TARE_HDG=0.0,OFFSET="));
                 LORA_SERIAL.println(activeHeadingOffsetDeg, 1);
-#if defined(__AVR_ATmega2560__)
-                Serial1.print(F("ACK:TARE_HDG=0.0,OFFSET="));
-                Serial1.println(activeHeadingOffsetDeg, 1);
-#endif
             }
             return;
         default:
@@ -1052,23 +1087,22 @@ void processTelecommand(char* rawCmd) {
 
     const char* comma = strchr(coords, ',');
     if (comma != NULL) {
-        double inLat = (double)parseDecimalFloat(coords);
-        double inLon = (double)parseDecimalFloat(comma + 1);
-        if (isfinite(inLat) && isfinite(inLon) && fabs(inLat) <= 90.0 && fabs(inLon) <= 180.0 && (inLat != 0.0 || inLon != 0.0)) {
-            targetGPS = GPSPoint(inLat, inLon);
+        int32_t inLat = parseDegE7(coords);
+        int32_t inLon = parseDegE7(comma + 1);
+        if (labs(inLat) <= 900000000L && labs(inLon) <= 1800000000L && (inLat != 0 || inLon != 0)) {
+            targetLatE7 = inLat;
+            targetLonE7 = inLon;
             targetGPSConfigured = true;
             updateTargetFromGPS();
 
             LORA_SERIAL.print(F("ACK:TARGET_GPS="));
-            LORA_SERIAL.print(targetGPS.lat, 6);
+            LORA_SERIAL.print((float)targetLatE7 * 1e-7f, 6);
             LORA_SERIAL.print(',');
-            LORA_SERIAL.println(targetGPS.lon, 6);
-#if defined(__AVR_ATmega2560__)
-            Serial1.print(F("ACK:TARGET_GPS="));
-            Serial1.print(targetGPS.lat, 6);
-            Serial1.print(',');
-            Serial1.println(targetGPS.lon, 6);
-#endif
+            LORA_SERIAL.print((float)targetLonE7 * 1e-7f, 6);
+            LORA_SERIAL.print(F(",LOCAL_E="));
+            LORA_SERIAL.print(targetLocal.x, 1);
+            LORA_SERIAL.print(F(",N="));
+            LORA_SERIAL.println(targetLocal.y, 1);
         }
     }
 }
@@ -1283,17 +1317,14 @@ void setup() {
         groundAlt = 0.0f;
     }
 
-    LocalPoint startPt(0.0f, 0.0f);
-    waypointManager.init(startPt, targetLocal, NUM_WAYPOINTS, WAYPOINT_ACCEPTANCE_RAD);
-    loiterGuidance.setCenter(targetLocal);
+    gnc.setTarget(targetLocal.x, targetLocal.y);
+    gnc.reset(millis());
+    gnc.forceState(FlightState::LAUNCH_PAD, millis());
+    lastYawForRateDeg = rawIntegratedYawDeg;
     Serial.print(F("[NAV] Target GPS set: "));
-    Serial.print(targetGPS.lat, 6);
+    Serial.print((float)targetLatE7 * 1e-7f, 6);
     Serial.print(F(", "));
-    Serial.println(targetGPS.lon, 6);
-
-    ekf.reset(0.0f, 0.0f, 0.0f, 0.0f);
-    flightSM.reset();
-    flightSM.forceState(FlightState::LAUNCH_PAD, millis());
+    Serial.println((float)targetLonE7 * 1e-7f, 6);
 
     missionStartMs = millis();
     lastControlUpdateMs = missionStartMs;
@@ -1310,16 +1341,17 @@ void loop() {
     // Task 0: Poll Telecommands, 100 Hz MPU6050 Attitude & GNSS I2C Stream
     pollTelecommands();
     pollMPU6050();
-    bool newGnssFix = pollGNSS();
+    // Latch new PVT solutions until the next 10 Hz tick consumes them (the old
+    // code only used a fix if it completed in the same loop pass as the tick,
+    // so most GNSS updates were silently dropped).
+    static bool gnssFixPending = false;
+    if (pollGNSS()) gnssFixPending = true;
     actuators.update(now);
 
     // Task 1: 10 Hz Control Loop
     if (now - lastControlUpdateMs >= (1000 / CONTROL_LOOP_HZ)) {
         float dt = (lastControlUpdateMs == 0) ? 0.1f : (float)(now - lastControlUpdateMs) / 1000.0f;
         lastControlUpdateMs = now;
-
-        FlightState prevState = flightSM.getState();
-        FlightState currentState = prevState;
 
         // 1. Read MS5611 Barometer
         float alt_agl = lastBaroAlt;
@@ -1331,81 +1363,46 @@ void loop() {
                 filteredPressure = (EMA_ALPHA * rawPressure) + ((1.0f - EMA_ALPHA) * filteredPressure);
                 alt_agl = pressureToAlt(filteredPressure, launchPressure);
                 lastBaroAlt = alt_agl;
-
-                if (currentState > FlightState::LAUNCH_PAD && currentState < FlightState::LANDING) {
-                    ekf.correctBaro(alt_agl);
-                }
             }
         }
 
-        if (gnssSats >= 4 && !launchGPSFixed && (gnssLat != 0.0 || gnssLon != 0.0)) {
-            launchGPS = GPSPoint(gnssLat, gnssLon);
+        if (gnssFixType >= 3 && gnssSats >= GNSS_MIN_SATS && !launchGPSFixed) {
+            launchLatE7 = gnssLatE7;
+            launchLonE7 = gnssLonE7;
+            launchCosLat = cosf((float)launchLatE7 * 1e-7f * ((float)M_PI / 180.0f));
             launchGPSFixed = true;
             updateTargetFromGPS();
         }
 
-        if (currentState > FlightState::LAUNCH_PAD && currentState < FlightState::LANDING) {
-            float heading_deg = 0.0f;
-            if (imuOK) {
-                heading_deg = wrap_360(rawIntegratedYawDeg + activeHeadingOffsetDeg);
-                ekf.correctHeading(heading_deg);
-            }
-
-            if (newGnssFix && gnssSats >= 4) {
-                GPSPoint currentGPS(gnssLat, gnssLon);
-                LocalPoint posLocal = gps_to_local(currentGPS, launchGPS);
-                ekf.correctGPS(posLocal.x, posLocal.y, gnssVelEast, gnssVelNorth, true);
-
-                if (currentState <= FlightState::DROGUE_DESCENT) {
-                    windEstimator.update(gnssVelEast, gnssVelNorth);
-                } else {
-                    float psi_rad = deg2rad(heading_deg);
-                    float air_vx = FORWARD_AIRSPEED * sinf(psi_rad);
-                    float air_vy = FORWARD_AIRSPEED * cosf(psi_rad);
-                    windEstimator.update(gnssVelEast - air_vx, gnssVelNorth - air_vy);
-                }
-            }
-
-            ekf.setWindEstimate(windEstimator.getWindX(), windEstimator.getWindY());
-            ekf.predict(dt, currentSteering);
+        // 2. Sensor snapshot for the GNC core
+        GncSensors sens;
+        sens.now_ms = now;
+        sens.baro_valid = baroOK;
+        sens.baro_alt_agl = alt_agl;
+        sens.gyro_valid = imuOK;
+        float yawNow = rawIntegratedYawDeg;
+        sens.yaw_rate_dps = imuOK ? (wrap_180(yawNow - lastYawForRateDeg) / dt) : 0.0f;
+        lastYawForRateDeg = yawNow;
+        sens.gnss_new = gnssFixPending;
+        gnssFixPending = false;
+        sens.gnss_valid = launchGPSFixed && gnssFixType >= 3 && gnssSats >= GNSS_MIN_SATS;
+        sens.gnss_x = 0.0f;
+        sens.gnss_y = 0.0f;
+        if (sens.gnss_valid) {
+            LocalPoint p = e7_to_local(gnssLatE7, gnssLonE7, launchLatE7, launchLonE7, launchCosLat);
+            sens.gnss_x = p.x;
+            sens.gnss_y = p.y;
         }
+        sens.gnss_vn = gnssVelNorth;
+        sens.gnss_ve = gnssVelEast;
+        sens.gnss_vd = gnssVelDown;
 
-        LocalPoint navPos(ekf.getX(), ekf.getY());
-        float navHeading = ekf.getHeadingDeg();
-        float navAlt = ekf.getAltitude();
-
-        if (!manualStateHold) {
-            flightSM.update(alt_agl, navHeading, navPos, targetLocal, dt, now);
-        } else {
-            flightSM.tickTimers(now);
-        }
-        currentState = flightSM.getState();
-
-        ekf.setKinematics(
-            (currentState == FlightState::DROGUE_DESCENT) ? 0.0f : FORWARD_AIRSPEED,
-            (currentState == FlightState::DROGUE_DESCENT) ? DROGUE_DESCENT_RATE : PARAFOIL_DESCENT_RATE
-        );
-
-        if (manualSteeringOverride && flightSM.isSteeringEnabled()) {
-            currentSteering = overrideSteeringVal;
-        } else if (currentState == FlightState::PRECISION_GUIDANCE) {
-            guidanceController.setWind(windEstimator.getWindX(), windEstimator.getWindY());
-            GuidanceOutput gOut = guidanceController.update(navPos, navHeading, navAlt, dt);
-            currentSteering = gOut.steering;
-        } else if (currentState == FlightState::TERMINAL_GUIDANCE) {
-            loiterGuidance.setWind(windEstimator.getWindX(), windEstimator.getWindY());
-            currentSteering = loiterGuidance.update(navPos, navHeading);
-        } else if (currentState == FlightState::FINAL_APPROACH) {
-            float desired_course = bearing(navPos, targetLocal);
-            WindCompResult comp = calculate_wind_corrected_heading(
-                desired_course, FORWARD_AIRSPEED, windEstimator.getWindX(), windEstimator.getWindY()
-            );
-            float err_deg = heading_error(navHeading, comp.heading_deg);
-            currentSteering = pid.update(deg2rad(err_deg), dt);
-        } else {
-            currentSteering = 0.0f;
-            pid.reset();
-        }
+        // 3. One GNC step (navigation, air data, mission sequencing, guidance)
+        gnc.manualStateHold = manualStateHold;
+        gnc.manualSteering = manualSteeringOverride && flightSM.isSteeringEnabled();
+        gnc.manualSteeringValue = overrideSteeringVal;
+        GncOutputs gout = gnc.step(sens);
+        currentSteering = gout.steering;
 
         syncActuatorsToState(now);
     }

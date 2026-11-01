@@ -7,17 +7,17 @@
 #define M_PI 3.14159265358979323846f
 #endif
 
-#define EARTH_RADIUS_M 6371000.0
+#define EARTH_RADIUS_M 6371000.0f
 
 // ----------------------------------------------------------------------------
 // Angle Wrapping Utilities
 // ----------------------------------------------------------------------------
 inline float deg2rad(float deg) {
-    return deg * (M_PI / 180.0f);
+    return deg * ((float)M_PI / 180.0f);
 }
 
 inline float rad2deg(float rad) {
-    return rad * (180.0f / M_PI);
+    return rad * (180.0f / (float)M_PI);
 }
 
 __attribute__((noinline))
@@ -39,8 +39,12 @@ inline float wrap_pi(float rad) {
     return rad;
 }
 
+inline float clampf(float v, float lo, float hi) {
+    return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+
 // ----------------------------------------------------------------------------
-// 2D Distance & Bearing
+// 2D Distance & Bearing (bearing: 0 = North, 90 = East)
 // ----------------------------------------------------------------------------
 __attribute__((noinline))
 inline float distance_xy(const LocalPoint& a, const LocalPoint& b) {
@@ -53,8 +57,7 @@ __attribute__((noinline))
 inline float bearing(const LocalPoint& from, const LocalPoint& to) {
     float dx = to.x - from.x;
     float dy = to.y - from.y;
-    float angle_deg = rad2deg(atan2f(dx, dy));
-    return wrap_360(angle_deg);
+    return wrap_360(rad2deg(atan2f(dx, dy)));
 }
 
 inline float heading_error(float current_heading, float desired_bearing) {
@@ -62,25 +65,22 @@ inline float heading_error(float current_heading, float desired_bearing) {
 }
 
 // ----------------------------------------------------------------------------
-// Equirectangular GPS to Local Coordinate Projection
+// GNSS -> local East/North.  Inputs are the raw UBX integers (1e-7 deg), so
+// the subtraction is exact even on AVR where double == float.
+// cos_lat0 = cos(launch latitude), computed once when the origin is fixed.
 // ----------------------------------------------------------------------------
-__attribute__((noinline))
-inline LocalPoint gps_to_local(const GPSPoint& pt, const GPSPoint& origin) {
-    float lat_rad = (float)pt.lat * (M_PI / 180.0f);
-    float lon_rad = (float)pt.lon * (M_PI / 180.0f);
-    float lat0_rad = (float)origin.lat * (M_PI / 180.0f);
-    float lon0_rad = (float)origin.lon * (M_PI / 180.0f);
-
-    float d_lat = lat_rad - lat0_rad;
-    float d_lon = lon_rad - lon0_rad;
-
-    float y = 6371000.0f * d_lat;
-    float x = 6371000.0f * cosf(lat0_rad) * d_lon;
+inline LocalPoint e7_to_local(int32_t lat_e7, int32_t lon_e7,
+                              int32_t lat0_e7, int32_t lon0_e7, float cos_lat0) {
+    const float k = 1.0e-7f * ((float)M_PI / 180.0f) * EARTH_RADIUS_M;  // metres per 1e-7 deg
+    float y = (float)(lat_e7 - lat0_e7) * k;
+    float x = (float)(lon_e7 - lon0_e7) * k * cos_lat0;
     return LocalPoint(x, y);
 }
 
 // ----------------------------------------------------------------------------
-// Aerodynamic Wind Crab Angle Compensation
+// Wind triangle: heading needed to hold a ground course, and the resulting
+// ground speed along that course.  Wind vector (wind_x, wind_y) is the
+// direction the air MOVES toward (East, North components).
 // ----------------------------------------------------------------------------
 __attribute__((noinline))
 inline WindCompResult calculate_wind_corrected_heading(
@@ -92,10 +92,9 @@ inline WindCompResult calculate_wind_corrected_heading(
     WindCompResult res;
     float chi_rad = deg2rad(desired_course_deg);
 
-    // Crosswind component (perpendicular to course): n_d = [cos(chi), -sin(chi)]
+    // Crosswind component (to the right of the course): n = [cos(chi), -sin(chi)]
     float w_perp = wind_x * cosf(chi_rad) - wind_y * sinf(chi_rad);
-
-    // Along-track wind (parallel to course): u_d = [sin(chi), cos(chi)]
+    // Along-track wind: u = [sin(chi), cos(chi)]
     float w_parallel = wind_x * sinf(chi_rad) + wind_y * cosf(chi_rad);
 
     res.crosswind_component = w_perp;
@@ -112,45 +111,24 @@ inline WindCompResult calculate_wind_corrected_heading(
     res.feasible = (fabsf(w_perp) <= (airspeed + 1e-5f));
 
     if (res.feasible) {
-        float ratio = -w_perp / airspeed;
-        if (ratio > 1.0f) ratio = 1.0f;
-        if (ratio < -1.0f) ratio = -1.0f;
-
+        float ratio = clampf(-w_perp / airspeed, -1.0f, 1.0f);
         float delta_rad = asinf(ratio);
-        float delta_deg = rad2deg(delta_rad);
-
-        res.crab_angle_deg = delta_deg;
-        res.heading_deg = wrap_360(desired_course_deg + delta_deg);
+        res.crab_angle_deg = rad2deg(delta_rad);
+        res.heading_deg = wrap_360(desired_course_deg + res.crab_angle_deg);
         res.ground_speed_along_track = airspeed * cosf(delta_rad) + w_parallel;
     } else {
-        // Crosswind exceeds airspeed: point fully into wind
+        // Crosswind exceeds airspeed: point fully into the crosswind
         float delta_deg = (w_perp < 0.0f) ? 90.0f : -90.0f;
         res.crab_angle_deg = delta_deg;
         res.heading_deg = wrap_360(desired_course_deg + delta_deg);
         res.ground_speed_along_track = w_parallel;
     }
-
     return res;
 }
 
-// ----------------------------------------------------------------------------
-// Circular Orbit Geometry
-// ----------------------------------------------------------------------------
-inline float calculate_tangent_heading(
-    const LocalPoint& center,
-    const LocalPoint& position,
-    LoiterDirection direction
-) {
-    float dx = position.x - center.x;
-    float dy = position.y - center.y;
-    if (sqrtf(dx * dx + dy * dy) < 1e-4f) {
-        return (direction == LoiterDirection::CLOCKWISE) ? 90.0f : 270.0f;
-    }
-
-    float radial_bearing = bearing(center, position);
-    if (direction == LoiterDirection::CLOCKWISE) {
-        return wrap_360(radial_bearing + 90.0f);
-    } else {
-        return wrap_360(radial_bearing - 90.0f);
-    }
+// Ground speed achievable along a ground course (never below 0.3 m/s so that
+// time-to-go predictions stay finite; callers treat <0.5 m/s as "no penetration").
+inline float ground_speed_on_course(float course_deg, float airspeed, float wind_x, float wind_y) {
+    WindCompResult r = calculate_wind_corrected_heading(course_deg, airspeed, wind_x, wind_y);
+    return (r.ground_speed_along_track > 0.3f) ? r.ground_speed_along_track : 0.3f;
 }

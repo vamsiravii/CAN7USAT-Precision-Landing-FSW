@@ -116,12 +116,20 @@ static inline float clampf(float val, float lo, float hi) {
 static uint32_t g_leftBrakeCutMs  = 0;
 static uint32_t g_rightBrakeCutMs = 0;
 
+static inline uint16_t brakeNeutralUs(uint8_t pin) {
+    return (pin == SERVO_LEFT_PIN) ? (uint16_t)BRAKE_LEFT_NEUTRAL_US : (uint16_t)BRAKE_RIGHT_NEUTRAL_US;
+}
+
+// Ground states: return the brake to neutral, keep driving it long enough for
+// a full-travel return (ES3004: 0.13 s/60 deg), then release the PWM to save
+// power.  (The old 65 ms hold let the servo stop part-way, leaving brake on.)
 static void writeServoWithInstantStop(uint8_t pin, uint16_t target_us, uint16_t prev_us, uint32_t now_ms) {
     uint32_t &cutMs = (pin == SERVO_LEFT_PIN) ? g_leftBrakeCutMs : g_rightBrakeCutMs;
-    if (target_us == 0 || target_us == ES3004_NEUTRAL_PULSE_US) {
-        if (prev_us != 0 && prev_us != ES3004_NEUTRAL_PULSE_US) {
-            writeHardwarePwmUs(pin, ES3004_NEUTRAL_PULSE_US);
-            cutMs = (now_ms ? now_ms : 1UL) + 65UL;
+    uint16_t neutral = brakeNeutralUs(pin);
+    if (target_us == 0 || target_us == neutral) {
+        if (prev_us != 0) {
+            writeHardwarePwmUs(pin, neutral);
+            cutMs = (now_ms ? now_ms : 1UL) + SERVO_NEUTRAL_HOLD_MS;
         } else if (cutMs == 0 || (int32_t)(now_ms - cutMs) >= 0) {
             cutMs = 0;
             writeHardwarePwmUs(pin, 0);
@@ -130,6 +138,19 @@ static void writeServoWithInstantStop(uint8_t pin, uint16_t target_us, uint16_t 
         cutMs = 0;
         writeHardwarePwmUs(pin, target_us);
     }
+}
+
+// Flight states: always drive the servo (an un-driven analog servo does not
+// hold or return to neutral).
+static void writeServoHold(uint8_t pin, uint16_t pulse_us) {
+    uint32_t &cutMs = (pin == SERVO_LEFT_PIN) ? g_leftBrakeCutMs : g_rightBrakeCutMs;
+    cutMs = 0;
+    writeHardwarePwmUs(pin, pulse_us);
+}
+
+static inline uint16_t brakePulseUs(float brake_norm, int16_t neutral_us, int16_t full_us) {
+    float us = (float)neutral_us + brake_norm * (float)(full_us - neutral_us);
+    return (uint16_t)(us + 0.5f);
 }
 
 ActuatorManager::ActuatorManager()
@@ -174,20 +195,16 @@ void ActuatorManager::applySteering(
     float s = clampf(steering, -1.0f, 1.0f);
     requested_steering_effort = s;
 
+    // Positive steering = pull the RIGHT brake = turn right (clockwise).
+    // Verify on the ground: command RIGHT and check the right trailing edge goes down.
     left_brake_norm  = (s < -0.02f) ? -s : 0.0f;
     right_brake_norm = (s >  0.02f) ?  s : 0.0f;
 
-    float lAng = SERVO_NEUTRAL_ANGLE + left_brake_norm  * (SERVO_MAX_BRAKE_ANGLE - SERVO_NEUTRAL_ANGLE);
-    float rAng = SERVO_NEUTRAL_ANGLE + right_brake_norm * (SERVO_MAX_BRAKE_ANGLE - SERVO_NEUTRAL_ANGLE);
+    uint16_t new_left_us  = brakePulseUs(left_brake_norm,  BRAKE_LEFT_NEUTRAL_US,  BRAKE_LEFT_FULL_US);
+    uint16_t new_right_us = brakePulseUs(right_brake_norm, BRAKE_RIGHT_NEUTRAL_US, BRAKE_RIGHT_FULL_US);
 
-    float lRatio = clampf(lAng / 90.0f, 0.0f, 1.0f);
-    float rRatio = clampf(rAng / 90.0f, 0.0f, 1.0f);
-
-    uint16_t new_left_us  = (left_brake_norm  > 0.0f) ? (uint16_t)(ES3004_MIN_PULSE_US + lRatio * (ES3004_NEUTRAL_PULSE_US - ES3004_MIN_PULSE_US)) : 0;
-    uint16_t new_right_us = (right_brake_norm > 0.0f) ? (uint16_t)(ES3004_MIN_PULSE_US + rRatio * (ES3004_NEUTRAL_PULSE_US - ES3004_MIN_PULSE_US)) : 0;
-
-    writeServoWithInstantStop(SERVO_LEFT_PIN, new_left_us, left_pulse_us, now_ms);
-    writeServoWithInstantStop(SERVO_RIGHT_PIN, new_right_us, right_pulse_us, now_ms);
+    writeServoHold(SERVO_LEFT_PIN, new_left_us);
+    writeServoHold(SERVO_RIGHT_PIN, new_right_us);
     left_pulse_us  = new_left_us;
     right_pulse_us = new_right_us;
 }
