@@ -837,12 +837,20 @@ static bool cmdStartsP(const char* a, PGM_P prefix, size_t n) {
 }
 
 __attribute__((noinline))
+static void sendControlAck(const __FlashStringHelper* msg) {
+    LORA_SERIAL.println(msg);
+#if defined(__AVR_ATmega2560__)
+    Serial1.println(msg);
+#endif
+}
+
+__attribute__((noinline))
 static void applyManualSteerCmd(float val, const __FlashStringHelper* msg) {
     manualSteeringOverride = true;
     overrideSteeringVal = val;
     currentSteering = val;
     actuators.applySteering(currentSteering, flightSM.isSteeringEnabled(), millis(), flightSM.getState());
-    LORA_SERIAL.println(msg);
+    sendControlAck(msg);
     printCurrentStateSummary();
 }
 
@@ -919,7 +927,7 @@ void processTelecommand(char* rawCmd) {
 
     if (strstr_P(rawCmd, PSTR("VBAT")) != NULL || strstr_P(rawCmd, PSTR("BAT:RESET")) != NULL || strstr_P(rawCmd, PSTR("RESET:BAT")) != NULL) {
         resetBatteryVoltage(8200U);
-        LORA_SERIAL.println(F("ACK:VBAT_RESET=8.20"));
+        sendControlAck(F("ACK:VBAT_RESET=8.20"));
         return;
     }
 
@@ -930,10 +938,7 @@ void processTelecommand(char* rawCmd) {
 #if HAS_SD_LOGGER
         startSDLogging();
 #endif
-        LORA_SERIAL.println(F("ACK:CX=ON"));
-#if defined(__AVR_ATmega2560__)
-        Serial1.println(F("ACK:CX=ON"));
-#endif
+        sendControlAck(F("ACK:CX=ON"));
         return;
     }
     if (strstr_P(rawCmd, PSTR("STOP")) != NULL || strstr_P(rawCmd, PSTR("OFF")) != NULL || rawCmd[0] == '-') {
@@ -941,10 +946,7 @@ void processTelecommand(char* rawCmd) {
 #if HAS_SD_LOGGER
         stopSDLogging();
 #endif
-        LORA_SERIAL.println(F("ACK:CX=OFF"));
-#if defined(__AVR_ATmega2560__)
-        Serial1.println(F("ACK:CX=OFF"));
-#endif
+        sendControlAck(F("ACK:CX=OFF"));
         return;
     }
 
@@ -982,8 +984,7 @@ void processTelecommand(char* rawCmd) {
     switch (code) {
         case 'M':
             manualStateHold = !manualStateHold;
-            LORA_SERIAL.print(F("ACK:MODE="));
-            LORA_SERIAL.println(manualStateHold ? F("MANUAL_HOLD") : F("AUTO"));
+            sendControlAck(manualStateHold ? F("ACK:MODE=MANUAL_HOLD") : F("ACK:MODE=AUTO"));
             printCurrentStateSummary();
             return;
         case 'L':
@@ -997,7 +998,7 @@ void processTelecommand(char* rawCmd) {
             return;
         case 'G':
             manualSteeringOverride = false;
-            LORA_SERIAL.println(F("ACK:STEER=GNC"));
+            sendControlAck(F("ACK:STEER=GNC"));
             printCurrentStateSummary();
             return;
         case 'S':
@@ -1006,20 +1007,23 @@ void processTelecommand(char* rawCmd) {
         case '+':
             telemetryEnabled = true;
             lastTelemetryMs = millis() - 900UL;
+            sendControlAck(F("ACK:CX=ON"));
             return;
         case '-':
             telemetryEnabled = false;
+            sendControlAck(F("ACK:CX=OFF"));
             return;
         case 'T':
             telemetryEnabled = !telemetryEnabled;
+            sendControlAck(telemetryEnabled ? F("ACK:CX=ON") : F("ACK:CX=OFF"));
             return;
         case 'B':
-            LORA_SERIAL.println(F("ACK:CALIB=STARTED"));
+            sendControlAck(F("ACK:CALIB=STARTED"));
             calibrateMPU6050(true);
             return;
         case 'C':
             clearMPU6050EEPROM();
-            LORA_SERIAL.println(F("ACK:CALIB=CLEARED"));
+            sendControlAck(F("ACK:CALIB=CLEARED"));
             return;
         case 'Z':
             if (imuOK) {
@@ -1027,6 +1031,10 @@ void processTelecommand(char* rawCmd) {
                 activeHeadingOffsetDeg = wrap_180(-rawIntegratedYawDeg);
                 LORA_SERIAL.print(F("ACK:TARE_HDG=0.0,OFFSET="));
                 LORA_SERIAL.println(activeHeadingOffsetDeg, 1);
+#if defined(__AVR_ATmega2560__)
+                Serial1.print(F("ACK:TARE_HDG=0.0,OFFSET="));
+                Serial1.println(activeHeadingOffsetDeg, 1);
+#endif
             }
             return;
         default:
@@ -1055,6 +1063,12 @@ void processTelecommand(char* rawCmd) {
             LORA_SERIAL.print(targetGPS.lat, 6);
             LORA_SERIAL.print(',');
             LORA_SERIAL.println(targetGPS.lon, 6);
+#if defined(__AVR_ATmega2560__)
+            Serial1.print(F("ACK:TARGET_GPS="));
+            Serial1.print(targetGPS.lat, 6);
+            Serial1.print(',');
+            Serial1.println(targetGPS.lon, 6);
+#endif
         }
     }
 }
@@ -1156,22 +1170,19 @@ void transmitLoRaTelemetry(
     printCommaFloat(flywheelRPM, 1);
     LORA_SERIAL.print(',');
     LORA_SERIAL.print(currentState);
-    float pDeg = atan2f(-ax, az) * 57.29578f;
-    float rDeg = atan2f(ay, az) * 57.29578f;
-    float yDeg = wrap_360(rawIntegratedYawDeg + activeHeadingOffsetDeg);
-    printCommaFloat(pDeg, 1);
-    printCommaFloat(rDeg, 1);
-    printCommaFloat(yDeg, 1);
-    LORA_SERIAL.println();
 #if defined(__AVR_ATmega2560__)
     Serial1.print(',');
     Serial1.print(currentState);
-    Serial1.print(',');
-    Serial1.print(pDeg, 1);
-    Serial1.print(',');
-    Serial1.print(rDeg, 1);
-    Serial1.print(',');
-    Serial1.println(yDeg, 1);
+#endif
+    float pDeg = atan2f(-ax, az) * 57.29578f;
+    float rDeg = atan2f(ay, az) * 57.29578f;
+    float yDeg = wrap_360(rawIntegratedYawDeg + activeHeadingOffsetDeg);
+    printCommaFloat(rDeg, 1); // Field 15: ROLL (matches GCS EXTENDED_CSV_18 order)
+    printCommaFloat(pDeg, 1); // Field 16: PITCH
+    printCommaFloat(yDeg, 1); // Field 17: YAW
+    LORA_SERIAL.println();
+#if defined(__AVR_ATmega2560__)
+    Serial1.println();
 #endif
 }
 
