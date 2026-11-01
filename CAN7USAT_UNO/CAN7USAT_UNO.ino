@@ -81,8 +81,8 @@ float groundAlt = 0.0f;
 // Navigation & Timing State Variables
 GPSPoint launchGPS(0.0, 0.0);
 bool launchGPSFixed = false;
-GPSPoint targetGPS(0.0, 0.0);
-bool targetGPSConfigured = false;
+GPSPoint targetGPS(DEFAULT_TARGET_LAT, DEFAULT_TARGET_LON);
+bool targetGPSConfigured = true;
 LocalPoint targetLocal(TARGET_DEFAULT_EAST, TARGET_DEFAULT_NORTH);
 
 // LoRa Telecommand & Telemetry Gating State
@@ -1286,6 +1286,10 @@ void setup() {
     LocalPoint startPt(0.0f, 0.0f);
     waypointManager.init(startPt, targetLocal, NUM_WAYPOINTS, WAYPOINT_ACCEPTANCE_RAD);
     loiterGuidance.setCenter(targetLocal);
+    Serial.print(F("[NAV] Target GPS set: "));
+    Serial.print(targetGPS.lat, 6);
+    Serial.print(F(", "));
+    Serial.println(targetGPS.lon, 6);
 
     ekf.reset(0.0f, 0.0f, 0.0f, 0.0f);
     flightSM.reset();

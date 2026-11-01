@@ -170,8 +170,10 @@
 #define WIND_EMA_ALPHA            0.05f
 
 // ----------------------------------------------------------------------------
-// Target Location (Default: 1200m East of Launch Pad)
+// Target Location (Default Hardcoded Coordinates: 26.717535° N, 84.301543° E)
 // ----------------------------------------------------------------------------
+#define DEFAULT_TARGET_LAT        26.717535
+#define DEFAULT_TARGET_LON        84.301543
 #define TARGET_DEFAULT_EAST       1200.0f
 #define TARGET_DEFAULT_NORTH      0.0f
 #define NUM_WAYPOINTS             10
