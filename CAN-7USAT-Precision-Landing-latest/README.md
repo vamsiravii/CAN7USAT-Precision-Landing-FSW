@@ -1,8 +1,8 @@
-﻿# CAN-7USAT Precision Landing Algorithm
+# CAN-7USAT Precision Landing Algorithm
 
 Python simulation and algorithm-development project for autonomous parafoil guidance, navigation, control, and state estimation.
 
-> **Experimental:** Simulation results do not establish hardware or flight readiness. This Python project is not directly deployable as Teensy firmware.
+> **Experimental:** Simulation results do not establish hardware or flight readiness. This Python project is not directly deployable as microcontroller firmware.
 
 ## Project structure
 
@@ -21,16 +21,14 @@ Python simulation and algorithm-development project for autonomous parafoil guid
 
 ### 1. Clone the repository
 
-The repository is private, so you need GitHub access to clone it.
-
-```powershell
-git clone --branch phase-4-4-wind-biased-loiter https://github.com/Rushil1506/CAN-7USAT-Precision-Landing.git
-cd CAN-7USAT-Precision-Landing
+```bash
+git clone https://github.com/vamsiravii/CAN7USAT-Precision-Landing-FSW.git
+cd CAN7USAT-Precision-Landing-FSW/CAN-7USAT-Precision-Landing-latest
 ```
 
-### 2. Set up Python
+### 2. Set up Python (Windows PowerShell)
 
-The development environment has been tested with Python 3.13.15 on Windows.
+The development environment has been tested with Python 3.13 on Windows.
 
 Create a virtual environment:
 
@@ -42,6 +40,15 @@ Install the project and development dependencies:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+```
+
+On macOS or Linux:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+.venv/bin/python run_simulation.py
 ```
 
 ### 3. Run the tests
@@ -86,15 +93,15 @@ The following values describe the simulation configuration, not certified flight
 
 ## Engineering reports and benchmarks
 
-Start with `FINAL_PROJECT_STATUS.md`.
+Start with [`docs/FINAL_PROJECT_STATUS.md`](docs/FINAL_PROJECT_STATUS.md). All phase reports are in [`docs/`](docs/).
 
 The Phase 4 and Phase 5 reports document guidance, actuator dynamics, loiter planning, state estimation, sensor faults, and validation results.
 
 Benchmark results must be interpreted alongside their scenario settings, random seeds, estimator modes, and actuator configuration. Results from one scenario should not be treated as proof of general robustness.
 
-## Teensy firmware
+## Relationship to the flight firmware
 
-This repository is the Python simulation and algorithm reference. A Teensy implementation requires a separate C++ port, real sensor interfaces, calibrated servo outputs, and hardware-in-the-loop testing.
+This folder is the Python simulation and algorithm reference. The C++ flight code lives in [`../CAN7USAT_UNO`](../CAN7USAT_UNO) and is a separate implementation, not a direct port: it uses a lighter navigation filter (`NavFilter`) in place of this project's EKF so that it fits on small microcontrollers. Running it on hardware still requires real sensor interfaces, calibrated servo outputs, and hardware-in-the-loop testing.
 
 Basic EMAX ES3004 servo movement does not validate the complete flight-control system, servo linkage geometry, or parafoil flight performance.
 

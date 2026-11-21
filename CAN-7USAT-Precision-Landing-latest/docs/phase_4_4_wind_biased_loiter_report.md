@@ -215,7 +215,7 @@ A critical finding of Phase 4.4 is why certain wind directions improve while oth
 
 ## 10. Test Suite & Verification Results
 
-A dedicated test module [`tests/test_loiter_center_planner.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/tests/test_loiter_center_planner.py) was implemented containing 17 comprehensive tests:
+A dedicated test module [`tests/test_loiter_center_planner.py`](../tests/test_loiter_center_planner.py) was implemented containing 17 comprehensive tests:
 - Configuration validation (default values, invalid negative gain/offset/deadband, invalid direction strings).
 - Zero wind deadband and pass-through behavior.
 - Directional conventions (upwind opposing wind, downwind aligning with wind).
