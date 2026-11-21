@@ -159,8 +159,8 @@ Phase 4.4c conducted an exhaustive evaluation of four architectural approaches:
 ## 6. Phase 5.1 / Phase 5.1b — Sensor Noise and EKF State Estimation Status
 
 1. **Modular Architecture:**
-   - [`sensors/sensor_model.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/sensors/sensor_model.py) implements configurable synthetic GNSS, Barometer, and Heading sensors with discrete sampling intervals and Gaussian noise.
-   - [`estimation/ekf.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/estimation/ekf.py) implements a 5-state Extended Kalman Filter ($\mathbf{x} = [x, y, z, \psi, \omega]^T$) with flight-phase kinematics, Joseph form covariance updates, and rigorous angle wrapping.
+   - [`sensors/sensor_model.py`](../sensors/sensor_model.py) implements configurable synthetic GNSS, Barometer, and Heading sensors with discrete sampling intervals and Gaussian noise.
+   - [`estimation/ekf.py`](../estimation/ekf.py) implements a 5-state Extended Kalman Filter ($\mathbf{x} = [x, y, z, \psi, \omega]^T$) with flight-phase kinematics, Joseph form covariance updates, and rigorous angle wrapping.
 2. **Strict Mode Separation & Ground-Truth Isolation:**
    - `"ideal"` (Default): Simulator ground truth passed to guidance and state machine transitions. Preserves 100% numerical parity with all historical baselines.
    - `"noisy_direct"`: Raw noisy sensor measurements fed directly to guidance and state machine transitions.
@@ -180,9 +180,9 @@ Phase 4.4c conducted an exhaustive evaluation of four architectural approaches:
 ## 7. Phase 5.2 — Sensor Faults, Dropouts, and Robust State Estimation Status
 
 1. **Synthetic Sensor Fault Framework:**
-   - [`sensors/fault_model.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/sensors/fault_model.py) implements comprehensive degradation modes: GNSS outages, frozen/stale streams, impulsive vector outliers, barometric reference bias and linear drift, heading sensor spikes/biases, and state-triggered activation anchored to flight phase transitions.
+   - [`sensors/fault_model.py`](../sensors/fault_model.py) implements comprehensive degradation modes: GNSS outages, frozen/stale streams, impulsive vector outliers, barometric reference bias and linear drift, heading sensor spikes/biases, and state-triggered activation anchored to flight phase transitions.
 2. **Robust Statistical Gating (NIS) & Fault Protection:**
-   - [`estimation/ekf.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/estimation/ekf.py) incorporates Normalized Innovation Squared (NIS / Mahalanobis distance) gating with $\chi^2$ thresholds ($4\sigma$ for GNSS pos/vel, $3\sigma$ for baro and heading).
+   - [`estimation/ekf.py`](../estimation/ekf.py) incorporates Normalized Innovation Squared (NIS / Mahalanobis distance) gating with $\chi^2$ thresholds ($4\sigma$ for GNSS pos/vel, $3\sigma$ for baro and heading).
    - Timestamp staleness rejection skips frozen packets with $\Delta t \le 0$.
    - Dead-reckoning covariance inflation automatically scales process noise covariance during sustained GNSS dropouts ($t_{\text{outage}} > 1.0\text{ s}$, scale = 2.5).
    - Consecutive rejection tracking prevents filter lockout cascades during signal recovery after extended outages.
@@ -193,7 +193,7 @@ Phase 4.4c conducted an exhaustive evaluation of four architectural approaches:
    - **Barometer Bias & Drift:** Statistical gating rejected 1,813 corrupted barometric samples, cutting altitude RMSE from **38.17 m** down to **23.53 m** (38.4% improvement).
    - **Severe Compound Stress Test:** Robust EKF attained lowest touchdown error (**26.69 m** vs 27.73 m direct and 29.58 m reference EKF) and lowest heading RMSE (**1.57°**).
 4. **Milestone Report:**
-   - Comprehensive documentation delivered in [`phase_5_2_sensor_fault_robustness_report.md`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/phase_5_2_sensor_fault_robustness_report.md).
+   - Comprehensive documentation delivered in [`phase_5_2_sensor_fault_robustness_report.md`](phase_5_2_sensor_fault_robustness_report.md).
 
 ---
 
@@ -216,7 +216,7 @@ Phase 4.4c conducted an exhaustive evaluation of four architectural approaches:
    - Replaced arbitrary force-acceptance counter bypass (`max_consecutive_rejections = 10`) with calibrated dead-reckoning covariance inflation (`dead_reckoning_q_inflation = 10.0`, default `max_consecutive_rejections = 0`).
    - Verified 15s GNSS outage recovers naturally without accepting persistent outliers.
 6. **Milestone Report:**
-   - Comprehensive audit delivered in [`phase_5_2b_gating_recovery_audit.md`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/phase_5_2b_gating_recovery_audit.md).
+   - Comprehensive audit delivered in [`phase_5_2b_gating_recovery_audit.md`](phase_5_2b_gating_recovery_audit.md).
 
 ---
 

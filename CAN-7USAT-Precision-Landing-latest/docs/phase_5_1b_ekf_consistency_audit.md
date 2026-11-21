@@ -143,7 +143,7 @@ Cosine gust ($+Y 3.0\text{ m/s}$ peak, active $t \in [140, 180]\text{ s}$ overla
 ### 4.1 Pytest Execution
 - **Total Test Count:** **324 tests collected and passed**
 - **Test Pass Rate:** **100% (324 passed, 0 failed in 25.88s)**
-- **New Unit Tests Added in [`tests/test_ekf_state_estimation.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/tests/test_ekf_state_estimation.py):**
+- **New Unit Tests Added in [`tests/test_ekf_state_estimation.py`](../tests/test_ekf_state_estimation.py):**
   1. `test_ekf_phase_aware_kinematics`: Verifies drogue kinematics ($V_a = 0, V_z = 17$) propagate purely via wind without phantom forward motion, and that GPS velocity does not alter heading when $V_a = 0$.
   2. `test_initial_seeding_at_t0`: Verifies `get_navigation_state()` at $t=0$ returns valid initial measurements rather than zeros.
   3. `test_transition_uses_nav_state`: Verifies `update_mission_state()` triggers using navigation state rather than ground truth.

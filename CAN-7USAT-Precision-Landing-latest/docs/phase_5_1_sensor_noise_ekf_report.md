@@ -124,9 +124,9 @@ $$F = \begin{bmatrix}
 ## 4. Software Implementation and Integration
 
 Three clean, decoupled components were added without altering existing control logic:
-1. [`sensors/sensor_model.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/sensors/sensor_model.py): Implements `SensorSuite`, `SensorNoiseConfig`, and `SensorMeasurement`.
-2. [`estimation/ekf.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/estimation/ekf.py): Implements `ExtendedKalmanFilter`, `EKFConfig`, `EKFStateEstimate`, and angle wrapping functions.
-3. [`simulation/simulator.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/simulation/simulator.py):
+1. [`sensors/sensor_model.py`](../sensors/sensor_model.py): Implements `SensorSuite`, `SensorNoiseConfig`, and `SensorMeasurement`.
+2. [`estimation/ekf.py`](../estimation/ekf.py): Implements `ExtendedKalmanFilter`, `EKFConfig`, `EKFStateEstimate`, and angle wrapping functions.
+3. [`simulation/simulator.py`](../simulation/simulator.py):
    - Added `sensor_suite`, `ekf`, and `state_estimation_mode` (`"ideal"`, `"noisy_direct"`, `"noisy_ekf"`).
    - Added `get_navigation_state()` helper for guidance dispatch.
    - Enhanced `SimulationSample` with estimation telemetry (`estimated_x`, `estimated_y`, `estimated_altitude`, `estimated_heading`, $\sigma_x$, $\sigma_y$, $\sigma_{\psi}$).
@@ -237,7 +237,7 @@ tests\test_wind_model.py ..                                              [100%]
 ============================ 321 passed in 24.16s =============================
 ```
 
-- **Total Test Cases:** **321 executed** (18 new unit & regression tests in [`tests/test_ekf_state_estimation.py`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/tests/test_ekf_state_estimation.py)).
+- **Total Test Cases:** **321 executed** (18 new unit & regression tests in [`tests/test_ekf_state_estimation.py`](../tests/test_ekf_state_estimation.py)).
 - **Pass Rate:** **100% (321 passed, 0 failed, 0 skipped)**.
 
 ---
@@ -277,7 +277,7 @@ PHASE 5.1 READY FOR REVIEW
 
 ## 9. Phase 5.1b Audit Addendum & Consistency Verification
 
-Following an independent engineering audit under Phase 5.1b (documented fully in [`phase_5_1b_ekf_consistency_audit.md`](file:///E:/Parikshit/Parikshit%20team/CAN-7USAT/Precision%20Landing%20Algo/phase_5_1b_ekf_consistency_audit.md)), four architectural defects in the initial Phase 5.1 implementation were identified and corrected:
+Following an independent engineering audit under Phase 5.1b (documented fully in [`phase_5_1b_ekf_consistency_audit.md`](phase_5_1b_ekf_consistency_audit.md)), four architectural defects in the initial Phase 5.1 implementation were identified and corrected:
 1. **Drogue Descent Kinematics Mismatch:** During drogue descent ($z \in [1000, 600]\text{ m}$), CanSat has zero airspeed ($V_a = 0$) and falls vertically at $17\text{ m/s}$. Phase 5.1 had applied forward flight ($V_a = 8\text{ m/s}, V_z = 2.5\text{ m/s}$), causing elevated position RMSE (~13 m). With flight-phase-aware kinematics, EKF position RMSE dropped to **2.82 – 2.92 m**.
 2. **Circular Wind Estimator Feedback:** Replaced self-referential EKF velocity feedback with independent GNSS ground velocity measurements ($V_{\text{GNSS}} - V_{\text{air}}(\psi)$).
 3. **Transition Ground-Truth Leakage:** Refactored `ParafoilSimulator.update_mission_state()` to strictly evaluate `get_navigation_state()` for all deployment, terminal guidance, shear planning, and breakout decisions.
